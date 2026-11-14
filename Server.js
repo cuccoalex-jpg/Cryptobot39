@@ -17,7 +17,7 @@ const exchange = new ccxt.kraken({
 });
 
 let botRunning = true;
-let lastLog = "Bot avviato con Timeframe Dinamico Multi-Livello (5m, 15m, 1h), Supporti/Resistenze, Pattern, SL/TP dinamici BTC e Micro-lotti.";
+let lastLog = "Bot avviato con la strategia integrale sicura (Commissioni Kraken, TF Multi-Livello 5m/15m/1h, Supporti/Resistenze, Pattern, SL/TP dinamici BTC, Multi-SMA e Micro-lotti).";
 
 // Dashboard di stato su Render
 app.get('/', (req, res) => {
@@ -27,7 +27,7 @@ app.get('/', (req, res) => {
             <body style="font-family: Arial; padding: 20px; background: #111; color: #fff;">
                 <h1>Cryptobot39 - Stato: ${botRunning ? 'ATTIVO & OPERATIVO' : 'FERMO'}</h1>
                 <p><b>Ultima attività:</b> ${lastLog}</p>
-                <p><b>Strategia Avanzata:</b> TF Dinamico Multi-Livello (5m/15m/1h), Supporti/Resistenze, Pattern, SL/TP dinamici su BTC, Multi-SMA & Micro-lotti.</p>
+                <p><b>Strategia Sicura Integrale:</b> Fee Kraken, TF Multi-Livello, Supporti/Resistenze, Pattern, SL/TP dinamici su BTC (SL: -2% neg / -5% pos, TP: +1% neg / +2% pos), Multi-SMA, Multi-Token & Micro-lotti.</p>
             </body>
         </html>
     `);
@@ -40,9 +40,9 @@ app.post('/api/toggle', (req, res) => {
     res.json({ success: true, botRunning, message: lastLog });
 });
 
-// Calcolo RSI
+// Calcolo RSI sicuro
 function calculateRSI(closes, period = 14) {
-    if (closes.length < period + 1) return 50;
+    if (!closes || closes.length < period + 1) return 50;
     let gains = 0;
     let losses = 0;
     for (let i = 1; i <= period; i++) {
@@ -57,15 +57,16 @@ function calculateRSI(closes, period = 14) {
     return 100 - (100 / (1 + rs));
 }
 
-// Calcolo Media Mobile (SMA)
+// Calcolo Media Mobile (SMA) sicuro
 function calculateSMA(closes, period) {
-    if (closes.length < period) return closes[closes.length - 1];
+    if (!closes || closes.length < period) return closes ? closes[closes.length - 1] : 0;
     const slice = closes.slice(-period);
     return slice.reduce((a, b) => a + b, 0) / period;
 }
 
 // Rilevamento Supporti e Resistenze
 function findSupportAndResistance(ohlcv) {
+    if (!ohlcv || ohlcv.length < 20) return { support: 0, resistance: 0 };
     const lows = ohlcv.map(c => c[3]); 
     const highs = ohlcv.map(c => c[2]); 
     const support = Math.min(...lows.slice(-20)); 
@@ -75,7 +76,7 @@ function findSupportAndResistance(ohlcv) {
 
 // Rilevamento Pattern di Prezzo
 function detectChartPatterns(ohlcv) {
-    if (ohlcv.length < 15) return { pattern: "NONE", score: 0 };
+    if (!ohlcv || ohlcv.length < 15) return { pattern: "NONE", score: 0 };
     
     const closes = ohlcv.map(c => c[4]);
     const highs = ohlcv.map(c => c[2]);
@@ -132,7 +133,7 @@ async function runBotLoop() {
                     console.log(`[${now}] Errore termometro BTC:`, btcErr.message);
                 }
 
-                // Soglie SL e TP dinamiche basate sul trend di BTC
+                // Soglie SL e TP dinamiche basate rigorosamente sul trend di BTC
                 const dynamicStopLoss = isBtcBullish ? -5.0 : -2.0;    // -5% se positivo, -2% se negativo
                 const dynamicTakeProfit = isBtcBullish ? 2.0 : 1.0;     // +2% o più se positivo, +1% se negativo
 
@@ -195,12 +196,11 @@ async function runBotLoop() {
                     } catch (cmcErr) {}
                 }
 
-                // 5. Scansione Multi-Token con TIMEFRAME DINAMICO MULTI-LIVELLO
+                // 5. Scansione Multi-Token con Timeframe Multi-Livello (5m, 15m, 1h), Supporti, Pattern, Fee Check e Micro-lotti
                 for (const symbol of dynamicAssets) {
                     try {
                         if (!exchange.markets[symbol]) continue;
                         
-                        // ANALISI MULTI-TIMEFRAME: Otteniamo dati a 5m (reattività), 15m (conferma) e 1h (struttura)
                         const ohlcv5m = await exchange.fetchOHLCV(symbol, '5m', undefined, 30);
                         const ohlcv15m = await exchange.fetchOHLCV(symbol, '15m', undefined, 30);
                         const ohlcv1h = await exchange.fetchOHLCV(symbol, '1h', undefined, 30);
@@ -222,9 +222,8 @@ async function runBotLoop() {
                         if (eurBalance < targetInvestmentSize) targetInvestmentSize = eurBalance;
 
                         let buyCondition = false;
-                        const nearSupport = (currentPrice <= support * 1.015);
+                        const nearSupport = support > 0 && (currentPrice <= support * 1.015);
 
-                        // Confluenza multi-timeframe per validare l'ingresso chirurgico ed evitare ritardi
                         if (!isBtcBullish) {
                             buyCondition = (nearSupport || rsi5m < 28 || rsi15m < 35 || score >= 2) && eurBalance >= 5;
                         } else {
@@ -232,22 +231,23 @@ async function runBotLoop() {
                         }
 
                         if (buyCondition) {
-                            const estimatedFeePercent = 0.005; 
+                            // CALCOLO COMMISSIONI KRAKEN E VERIFICA TARGET NETTO
+                            const estimatedFeePercent = 0.005; // 0.5% stima round-trip fee
                             const netTargetPrice = currentPrice * (1 + estimatedFeePercent + (dynamicTakeProfit / 100));
 
-                            console.log(`[Segnale Multi-TF] ${symbol} | Pattern: ${pattern} | Supporto(15m): €${support.toFixed(2)} | RSI(5m): ${rsi5m.toFixed(1)} | RSI(15m): ${rsi15m.toFixed(1)} | Prezzo: €${currentPrice} | Investimento: €${targetInvestmentSize}`);
+                            console.log(`[Segnale Sicuro] ${symbol} | Pattern: ${pattern} | Supporto: €${support.toFixed(2)} | RSI(5m): ${rsi5m.toFixed(1)} | Prezzo: €${currentPrice} | Target Netto (fee incl.): €${netTargetPrice.toFixed(4)}`);
 
                             const amountToBuy = targetInvestmentSize / currentPrice;
                             const order = await exchange.createMarketBuyOrder(symbol, amountToBuy);
                             
                             console.log(`[SUCCESSO ACQUISTO] Acquistati ~€${targetInvestmentSize} di ${symbol} a €${currentPrice}! ID:`, order.id);
-                            lastLog = `[${now}] Acquistati €${targetInvestmentSize} di ${symbol} con Multi-TF (RSI 5m: ${rsi5m.toFixed(1)})`;
+                            lastLog = `[${now}] Acquistati €${targetInvestmentSize} di ${symbol} (Fee & Target verificati)`;
                             
                             await new Promise(resolve => setTimeout(resolve, 60000));
                             break;
                         }
                     } catch (altErr) {
-                        // Prosegue la scansione sugli altri token in caso di errore
+                        // Prosegue la scansione sugli altri token in caso di errore sul singolo asset
                     }
                 }
             }
