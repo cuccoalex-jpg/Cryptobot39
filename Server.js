@@ -17,7 +17,7 @@ const exchange = new ccxt.kraken({
 });
 
 let botRunning = true;
-let lastLog = "Bot avviato con Analisi Tecnica Completa (Supporti/Resistenze, Testa e Spalle, Pattern, SL/TP dinamici BTC, Multi-SMA, Multi-token e Micro-lotti).";
+let lastLog = "Bot avviato con Timeframe Dinamico Multi-Livello (5m, 15m, 1h), Supporti/Resistenze, Pattern, SL/TP dinamici BTC e Micro-lotti.";
 
 // Dashboard di stato su Render
 app.get('/', (req, res) => {
@@ -27,7 +27,7 @@ app.get('/', (req, res) => {
             <body style="font-family: Arial; padding: 20px; background: #111; color: #fff;">
                 <h1>Cryptobot39 - Stato: ${botRunning ? 'ATTIVO & OPERATIVO' : 'FERMO'}</h1>
                 <p><b>Ultima attività:</b> ${lastLog}</p>
-                <p><b>Strategia Integrale:</b> Supporti/Resistenze, Pattern di Prezzo, SL/TP dinamici su BTC, Multi-SMA, Multi-Token & Micro-lotti.</p>
+                <p><b>Strategia Avanzata:</b> TF Dinamico Multi-Livello (5m/15m/1h), Supporti/Resistenze, Pattern, SL/TP dinamici su BTC, Multi-SMA & Micro-lotti.</p>
             </body>
         </html>
     `);
@@ -64,16 +64,16 @@ function calculateSMA(closes, period) {
     return slice.reduce((a, b) => a + b, 0) / period;
 }
 
-// Rilevamento Supporti e Resistenze dai massimi/minimi recenti
+// Rilevamento Supporti e Resistenze
 function findSupportAndResistance(ohlcv) {
-    const lows = ohlcv.map(c => c[3]); // Prezzi minimi
-    const highs = ohlcv.map(c => c[2]); // Prezzi massimi
-    const support = Math.min(...lows.slice(-20)); // Minimo delle ultime 20 candele
-    const resistance = Math.max(...highs.slice(-20)); // Massimo delle ultime 20 candele
+    const lows = ohlcv.map(c => c[3]); 
+    const highs = ohlcv.map(c => c[2]); 
+    const support = Math.min(...lows.slice(-20)); 
+    const resistance = Math.max(...highs.slice(-20)); 
     return { support, resistance };
 }
 
-// Rilevamento Pattern di Prezzo (es. Testa e Spalle di inversione / Rimbalzo su supporto)
+// Rilevamento Pattern di Prezzo
 function detectChartPatterns(ohlcv) {
     if (ohlcv.length < 15) return { pattern: "NONE", score: 0 };
     
@@ -84,17 +84,14 @@ function detectChartPatterns(ohlcv) {
     let pattern = "NORMAL_ACTION";
     let score = 0;
 
-    // Semplificazione algoritmica per individuare pattern di Testa e Spalle ribassista/rialzistà o minimi crescenti
     const currentClose = closes[closes.length - 1];
     const recentMin = Math.min(...lows.slice(-10));
     
-    // Controllo rimbalzo pulito su supporto (doppio minimo o test di supporto)
     if (Math.abs(currentClose - recentMin) / recentMin < 0.01) {
         pattern = "SUPPORT_BOUNCE";
         score += 2;
     }
 
-    // Controllo struttura a campana / Testa e Spalle abbozzato sulle ultime 15 candele
     const p = highs.slice(-15);
     const mid = Math.floor(p.length / 2);
     if (p[mid] > p[0] && p[mid] > p[p.length - 1] && p[mid] > p[mid - 2] && p[mid] > p[mid + 2]) {
@@ -118,10 +115,10 @@ async function runBotLoop() {
                 const eurBalance = balance.free['EUR'] || 0;
                 console.log(`[${now}] Saldo disponibile EUR: €${eurBalance.toFixed(2)}`);
 
-                // 2. Termometro BTC & Analisi del Trend (Positivo vs Negativo)
+                // 2. Termometro BTC & Analisi del Trend (TF 15m)
                 let isBtcBullish = true;
                 try {
-                    const btcOhlcv = await exchange.fetchOHLCV('BTC/EUR', '1h', undefined, 50);
+                    const btcOhlcv = await exchange.fetchOHLCV('BTC/EUR', '15m', undefined, 50);
                     const btcCloses = btcOhlcv.map(c => c[4]);
                     const btcRsi = calculateRSI(btcCloses);
                     const btcPrice = btcCloses[btcCloses.length - 1];
@@ -135,11 +132,11 @@ async function runBotLoop() {
                     console.log(`[${now}] Errore termometro BTC:`, btcErr.message);
                 }
 
-                // Soglie Dinamiche SL e TP basate sul trend di BTC
+                // Soglie SL e TP dinamiche basate sul trend di BTC
                 const dynamicStopLoss = isBtcBullish ? -5.0 : -2.0;    // -5% se positivo, -2% se negativo
                 const dynamicTakeProfit = isBtcBullish ? 2.0 : 1.0;     // +2% o più se positivo, +1% se negativo
 
-                // 3. Monitoraggio posizioni aperte (TP & SL dinamici)
+                // 3. Monitoraggio posizioni aperte (TP & SL dinamici effettivi)
                 const activeAssets = ['ETH/EUR', 'SOL/EUR', 'XRP/EUR', 'ADA/EUR', 'AVAX/EUR', 'LINK/EUR'];
                 for (const symbol of activeAssets) {
                     try {
@@ -198,52 +195,53 @@ async function runBotLoop() {
                     } catch (cmcErr) {}
                 }
 
-                // 5. Scansione Multi-Token con Analisi Tecnica Completa (Supporti/Resistenze, Pattern, Multi-SMA, RSI) & Micro-lotti
+                // 5. Scansione Multi-Token con TIMEFRAME DINAMICO MULTI-LIVELLO
                 for (const symbol of dynamicAssets) {
                     try {
                         if (!exchange.markets[symbol]) continue;
                         
-                        const ohlcv = await exchange.fetchOHLCV(symbol, '1h', undefined, 50);
-                        const closes = ohlcv.map(c => c[4]);
-                        const rsi = calculateRSI(closes);
-                        const currentPrice = closes[closes.length - 1];
-                        
-                        // Medie mobili multi-periodo
-                        const sma7 = calculateSMA(closes, 7);
-                        const sma20 = calculateSMA(closes, 20);
-                        const sma50 = calculateSMA(closes, 50);
+                        // ANALISI MULTI-TIMEFRAME: Otteniamo dati a 5m (reattività), 15m (conferma) e 1h (struttura)
+                        const ohlcv5m = await exchange.fetchOHLCV(symbol, '5m', undefined, 30);
+                        const ohlcv15m = await exchange.fetchOHLCV(symbol, '15m', undefined, 30);
+                        const ohlcv1h = await exchange.fetchOHLCV(symbol, '1h', undefined, 30);
 
-                        // Analisi Supporti, Resistenze e Pattern Grafici
-                        const { support, resistance } = findSupportAndResistance(ohlcv);
-                        const { pattern, score } = detectChartPatterns(ohlcv);
+                        const closes5m = ohlcv5m.map(c => c[4]);
+                        const closes15m = ohlcv15m.map(c => c[4]);
+                        const closes1h = ohlcv1h.map(c => c[4]);
 
-                        // Taglia dell'investimento: micro-lotti prudenti (6€) se ribassista, standard (12€) se rialzista
+                        const rsi5m = calculateRSI(closes5m);
+                        const rsi15m = calculateRSI(closes15m);
+                        const currentPrice = closes5m[closes5m.length - 1];
+
+                        const sma20_1h = calculateSMA(closes1h, 20);
+                        const { support, resistance } = findSupportAndResistance(ohlcv15m);
+                        const { pattern, score } = detectChartPatterns(ohlcv15m);
+
+                        // Taglia dell'investimento: micro-lotti (6€) se ribassista, standard (12€) se rialzista
                         let targetInvestmentSize = isBtcBullish ? 12 : 6; 
                         if (eurBalance < targetInvestmentSize) targetInvestmentSize = eurBalance;
 
-                        // Condizioni d'ingresso avanzate con confluenza di Supporti, Pattern e Indicatori:
                         let buyCondition = false;
-                        const nearSupport = (currentPrice <= support * 1.02); // Prezzo vicino o test del supporto
+                        const nearSupport = (currentPrice <= support * 1.015);
 
+                        // Confluenza multi-timeframe per validare l'ingresso chirurgico ed evitare ritardi
                         if (!isBtcBullish) {
-                            // In mercato ribassista: compra solo se siamo vicini a un supporto chiave, c'è un pattern favorevole o RSI molto basso
-                            buyCondition = (nearSupport || rsi < 32 || score >= 2) && eurBalance >= 5;
+                            buyCondition = (nearSupport || rsi5m < 28 || rsi15m < 35 || score >= 2) && eurBalance >= 5;
                         } else {
-                            // In mercato rialzista: ottime occasioni su rimbalzi dai supporti o RSI in ipervenduto/medie mobili
-                            buyCondition = (nearSupport || rsi < 40 || currentPrice < sma20) && eurBalance >= 5;
+                            buyCondition = (nearSupport || rsi5m < 38 || currentPrice < sma20_1h) && eurBalance >= 5;
                         }
 
                         if (buyCondition) {
                             const estimatedFeePercent = 0.005; 
                             const netTargetPrice = currentPrice * (1 + estimatedFeePercent + (dynamicTakeProfit / 100));
 
-                            console.log(`[Segnale Avanzato] ${symbol} | Pattern: ${pattern} | Supporto: €${support.toFixed(2)} | Resistenza: €${resistance.toFixed(2)} | RSI: ${rsi.toFixed(1)} | Prezzo: €${currentPrice} | Investimento: €${targetInvestmentSize}`);
+                            console.log(`[Segnale Multi-TF] ${symbol} | Pattern: ${pattern} | Supporto(15m): €${support.toFixed(2)} | RSI(5m): ${rsi5m.toFixed(1)} | RSI(15m): ${rsi15m.toFixed(1)} | Prezzo: €${currentPrice} | Investimento: €${targetInvestmentSize}`);
 
                             const amountToBuy = targetInvestmentSize / currentPrice;
                             const order = await exchange.createMarketBuyOrder(symbol, amountToBuy);
                             
                             console.log(`[SUCCESSO ACQUISTO] Acquistati ~€${targetInvestmentSize} di ${symbol} a €${currentPrice}! ID:`, order.id);
-                            lastLog = `[${now}] Acquistati €${targetInvestmentSize} di ${symbol} (Pattern: ${pattern}, Supporto testato)`;
+                            lastLog = `[${now}] Acquistati €${targetInvestmentSize} di ${symbol} con Multi-TF (RSI 5m: ${rsi5m.toFixed(1)})`;
                             
                             await new Promise(resolve => setTimeout(resolve, 60000));
                             break;
