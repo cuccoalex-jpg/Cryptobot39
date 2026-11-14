@@ -17,7 +17,7 @@ const exchange = new ccxt.kraken({
 });
 
 let botRunning = true;
-let lastLog = "Bot avviato con Scansione Completa Multi-Asset (Top CMC + Kraken, Analisi Ipercomprato/Trend, Supporti/Resistenze, Fee Kraken, SL/TP dinamici BTC).";
+let lastLog = "Bot avviato con rotazione multi-asset bilanciata (Scansione ordinata CMC/Kraken, Stop accanimento su singolo asset, Fee Kraken, SL/TP dinamici BTC).";
 
 // Dashboard di stato su Render
 app.get('/', (req, res) => {
@@ -27,7 +27,7 @@ app.get('/', (req, res) => {
             <body style="font-family: Arial; padding: 20px; background: #111; color: #fff;">
                 <h1>Cryptobot39 - Stato: ${botRunning ? 'ATTIVO & OPERATIVO' : 'FERMO'}</h1>
                 <p><b>Ultima attività:</b> ${lastLog}</p>
-                <p><b>Strategia Completa Master:</b> Scansione Totale CMC & Kraken, Analisi Ipercomprato/Forza & Supporti/Resistenze, SL/TP dinamici su BTC, Fee Check & Micro-lotti.</p>
+                <p><b>Strategia Rotazionale:</b> Scansione completa su tutto il paniere, bilanciamento dinamico Ipervenduto/Forza, SL/TP dinamici su BTC.</p>
             </body>
         </html>
     `);
@@ -181,29 +181,34 @@ async function runBotLoop() {
                     }
                 }
 
-                // 4. SCANSIONE COMPLETA: Unione di tutte le crypto da CoinMarketCap + Lista nativa Kraken in EUR
-                let dynamicAssets = ['ETH/EUR', 'SOL/EUR', 'XRP/EUR', 'ADA/EUR', 'AVAX/EUR', 'LINK/EUR', 'DOT/EUR', 'MATIC/EUR', 'UNI/EUR', 'ATOM/EUR'];
+                // 4. SCANSIONE DINAMICA COMPLETA (CoinMarketCap + Kraken)
+                let dynamicAssets = ['ETH/EUR', 'SOL/EUR', 'XRP/EUR', 'ADA/EUR', 'AVAX/EUR', 'LINK/EUR', 'DOT/EUR', 'MATIC/EUR', 'UNI/EUR', 'ATOM/EUR', 'NEAR/EUR', 'FET/EUR'];
                 if (CMC_API_KEY) {
                     try {
                         const cmcResponse = await axios.get('https://pro-api.coinmarketcap.com/v1/cryptocurrency/listings/latest', {
                             headers: { 'X-CMC_PRO_API_KEY': CMC_API_KEY },
-                            params: { start: 1, limit: 50, convert: 'USD' }
+                            params: { start: 1, limit: 60, convert: 'USD' }
                         });
                         const cmcCoins = cmcResponse.data.data;
                         const topSymbols = cmcCoins.map(coin => `${coin.symbol}/EUR`);
                         const validCmcAssets = topSymbols.filter(sym => exchange.markets[sym]);
-                        // Unisce e rimuove i doppioni
                         dynamicAssets = Array.from(new Set([...validCmcAssets, ...dynamicAssets]));
                     } catch (cmcErr) {
-                        console.log("Errore recupero CoinMarketCap, uso paniere Kraken predefinito.");
+                        console.log("Errore recupero CoinMarketCap, uso paniere esteso Kraken.");
                     }
                 }
 
-                // 5. ANALISI MASTER MASTER: Sfoglia tutto, valuta ipervenduto, ipercomprato, resistenze, supporti e momentum
+                // 5. ANALISI ROTAZIONALE DI TUTTO IL PANIERE
                 for (const symbol of dynamicAssets) {
                     try {
                         if (!exchange.markets[symbol]) continue;
                         
+                        // EVITA ACCANIMENTO: Salta l'asset se ne possediamo già una quantità in portafoglio
+                        const baseCurrency = symbol.split('/')[0];
+                        if (balance.free[baseCurrency] && balance.free[baseCurrency] > 0.0001) {
+                            continue; 
+                        }
+
                         const ohlcv5m = await exchange.fetchOHLCV(symbol, '5m', undefined, 30);
                         const ohlcv15m = await exchange.fetchOHLCV(symbol, '15m', undefined, 30);
                         const ohlcv1h = await exchange.fetchOHLCV(symbol, '1h', undefined, 30);
@@ -224,30 +229,26 @@ async function runBotLoop() {
                         let targetInvestmentSize = isBtcBullish ? 12 : 6; 
                         if (eurBalance < targetInvestmentSize) targetInvestmentSize = eurBalance;
 
-                        // Condizioni di analisi completa:
+                        // REGOLE DI INGRESSO SELETTIVE E BILANCIATE:
                         const nearSupport = support > 0 && (currentPrice <= support * 1.015);
-                        const isOversold = (rsi5m < 30 || rsi15m < 38); // Ipervenduto
-                        
-                        // Valutazione Ipercomprato / Forza / Breakout di Resistenza
-                        const isOverboughtStrong = (rsi5m > 65 && rsi15m > 60 && currentPrice >= resistance * 0.99); // In ipercomprato vicino alla resistenza o in pieno breakout
+                        const realOversold = (rsi5m < 28 && rsi15m < 35); // Ipervenduto reale e profondo
+                        const strongMomentum = (rsi5m > 62 && rsi15m > 58 && currentPrice >= resistance * 0.985); // Forza / Ipercomprato sano su resistenza
 
                         let buyCondition = false;
                         let reason = "";
 
                         if (!isBtcBullish) {
-                            // In mercato ribassista predilige i supporti e l'ipervenduto
-                            if (nearSupport || isOversold || score >= 2) {
+                            if (nearSupport || realOversold) {
                                 buyCondition = (eurBalance >= 5);
-                                reason = nearSupport ? "Test Supporto (Bearish)" : "Ipervenduto Profondo";
+                                reason = nearSupport ? "Test Supporto (Bearish)" : "Ipervenduto Reale Profondo";
                             }
                         } else {
-                            // In mercato rialzista cerca tutto: ipervenduto, supporti, ma ANALIZZA ANCHE GLI IPERCOMPRATI E I BREAKOUT DI RESISTENZA!
-                            if (isOverboughtStrong) {
+                            if (strongMomentum) {
                                 buyCondition = (eurBalance >= 5);
-                                reason = `Ipercomprato in Breakout su Resistenza (€${resistance.toFixed(2)})`;
-                            } else if (nearSupport || isOversold) {
+                                reason = `Forza / Ipercomprato su Resistenza (€${resistance.toFixed(2)})`;
+                            } else if (nearSupport || realOversold) {
                                 buyCondition = (eurBalance >= 5);
-                                reason = nearSupport ? "Rimbalzo da Supporto" : "Ipervenduto a Sconto";
+                                reason = nearSupport ? "Rimbalzo da Supporto" : "Ipervenduto Reale";
                             }
                         }
 
@@ -255,19 +256,19 @@ async function runBotLoop() {
                             const estimatedFeePercent = 0.005; 
                             const netTargetPrice = currentPrice * (1 + estimatedFeePercent + (dynamicTakeProfit / 100));
 
-                            console.log(`[Analisi Master] Trovata opportunità su ${symbol} | Motivo: ${reason} | RSI(5m): ${rsi5m.toFixed(1)} | Supporto: €${support.toFixed(2)} | Resistenza: €${resistance.toFixed(2)} | Prezzo: €${currentPrice} | Target Netto: €${netTargetPrice.toFixed(4)}`);
+                            console.log(`[Scansione Rotazionale] Scelto ${symbol} | Motivo: ${reason} | RSI(5m): ${rsi5m.toFixed(1)} | Supporto: €${support.toFixed(2)} | Resistenza: €${resistance.toFixed(2)} | Prezzo: €${currentPrice}`);
 
                             const amountToBuy = targetInvestmentSize / currentPrice;
                             const order = await exchange.createMarketBuyOrder(symbol, amountToBuy);
                             
-                            console.log(`[SUCCESSO ACQUISTO MASTER] Acquistati ~€${targetInvestmentSize} di ${symbol} a €${currentPrice} (${reason})! ID:`, order.id);
+                            console.log(`[SUCCESSO ACQUISTO ROTAZIONALE] Acquistati ~€${targetInvestmentSize} di ${symbol} a €${currentPrice} (${reason})! ID:`, order.id);
                             lastLog = `[${now}] Acquistati €${targetInvestmentSize} di ${symbol} (${reason})`;
                             
                             await new Promise(resolve => setTimeout(resolve, 60000));
                             break;
                         }
                     } catch (altErr) {
-                        // Salta l'asset in caso di errore temporaneo e continua la scansione sugli altri
+                        // Passa all'asset successivo della lista in caso di errore
                     }
                 }
             }
