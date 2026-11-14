@@ -17,7 +17,7 @@ const exchange = new ccxt.kraken({
 });
 
 let botRunning = true;
-let lastLog = "Bot avviato con rotazione multi-asset bilanciata (Scansione ordinata CMC/Kraken, Stop accanimento su singolo asset, Fee Kraken, SL/TP dinamici BTC).";
+let lastLog = "Bot avviato con gestione avanzata giornate negative (Filtro anti-crollo, conferme di rimbalzo su supporto, micro-lotti a basso rischio, Fee Kraken).";
 
 // Dashboard di stato su Render
 app.get('/', (req, res) => {
@@ -27,7 +27,7 @@ app.get('/', (req, res) => {
             <body style="font-family: Arial; padding: 20px; background: #111; color: #fff;">
                 <h1>Cryptobot39 - Stato: ${botRunning ? 'ATTIVO & OPERATIVO' : 'FERMO'}</h1>
                 <p><b>Ultima attività:</b> ${lastLog}</p>
-                <p><b>Strategia Rotazionale:</b> Scansione completa su tutto il paniere, bilanciamento dinamico Ipervenduto/Forza, SL/TP dinamici su BTC.</p>
+                <p><b>Strategia Sicura Anti-Crollo:</b> Ingresso su supporto solo con conferma di rimbalzo in giorni rossi, lotti ridotti a 5€, SL/TP dinamici su BTC.</p>
             </body>
         </html>
     `);
@@ -111,7 +111,7 @@ async function runBotLoop() {
                 const now = new Date().toLocaleString();
                 await exchange.loadMarkets();
 
-                // 1. Lettura Saldi su Kraken
+                // 1. Lettura Saldi su Kraken (in EUR)
                 const balance = await exchange.fetchBalance();
                 const eurBalance = balance.free['EUR'] || 0;
                 console.log(`[${now}] Saldo disponibile EUR: €${eurBalance.toFixed(2)}`);
@@ -127,7 +127,7 @@ async function runBotLoop() {
 
                     isBtcBullish = (btcPrice >= btcSma20 && btcRsi >= 45);
 
-                    lastLog = `[${now}] BTC a €${btcPrice.toFixed(2)} (RSI: ${btcRsi.toFixed(1)}) | Trend: ${isBtcBullish ? 'POSITIVO (Bullish)' : 'NEGATIVO (Bearish)'}`;
+                    lastLog = `[${now}] BTC a €${btcPrice.toFixed(2)} (RSI: ${btcRsi.toFixed(1)}) | Trend: ${isBtcBullish ? 'POSITIVO (Bullish)' : 'NEGATIVO (Bearish - Sudditanza ai ribassi)'}`;
                     console.log(lastLog);
                 } catch (btcErr) {
                     console.log(`[${now}] Errore termometro BTC:`, btcErr.message);
@@ -182,28 +182,26 @@ async function runBotLoop() {
                 }
 
                 // 4. SCANSIONE DINAMICA COMPLETA (CoinMarketCap + Kraken)
-                let dynamicAssets = ['ETH/EUR', 'SOL/EUR', 'XRP/EUR', 'ADA/EUR', 'AVAX/EUR', 'LINK/EUR', 'DOT/EUR', 'MATIC/EUR', 'UNI/EUR', 'ATOM/EUR', 'NEAR/EUR', 'FET/EUR'];
+                let dynamicAssets = ['ETH/EUR', 'SOL/EUR', 'XRP/EUR', 'ADA/EUR', 'AVAX/EUR', 'LINK/EUR', 'DOT/EUR', 'MATIC/EUR', 'UNI/EUR', 'ATOM/EUR'];
                 if (CMC_API_KEY) {
                     try {
                         const cmcResponse = await axios.get('https://pro-api.coinmarketcap.com/v1/cryptocurrency/listings/latest', {
                             headers: { 'X-CMC_PRO_API_KEY': CMC_API_KEY },
-                            params: { start: 1, limit: 60, convert: 'USD' }
+                            params: { start: 1, limit: 50, convert: 'USD' }
                         });
                         const cmcCoins = cmcResponse.data.data;
                         const topSymbols = cmcCoins.map(coin => `${coin.symbol}/EUR`);
                         const validCmcAssets = topSymbols.filter(sym => exchange.markets[sym]);
                         dynamicAssets = Array.from(new Set([...validCmcAssets, ...dynamicAssets]));
-                    } catch (cmcErr) {
-                        console.log("Errore recupero CoinMarketCap, uso paniere esteso Kraken.");
-                    }
+                    } catch (cmcErr) {}
                 }
 
-                // 5. ANALISI ROTAZIONALE DI TUTTO IL PANIERE
+                // 5. ANALISI ROTAZIONALE ANTI-CROLLO
                 for (const symbol of dynamicAssets) {
                     try {
                         if (!exchange.markets[symbol]) continue;
                         
-                        // EVITA ACCANIMENTO: Salta l'asset se ne possediamo già una quantità in portafoglio
+                        // EVITA ACCANIMENTO: Salta l'asset se ne possediamo già una quantità
                         const baseCurrency = symbol.split('/')[0];
                         if (balance.free[baseCurrency] && balance.free[baseCurrency] > 0.0001) {
                             continue; 
@@ -221,34 +219,39 @@ async function runBotLoop() {
                         const rsi15m = calculateRSI(closes15m);
                         const currentPrice = closes5m[closes5m.length - 1];
 
-                        const sma20_1h = calculateSMA(closes1h, 20);
+                        // Verifica se l'ultima candela a 5m è VERDE (chiusura > apertura), segno di reazione/rimbalzo
+                        const lastOpen5m = ohlcv5m[ohlcv5m.length - 1][1];
+                        const isGreenBounce = currentPrice > lastOpen5m;
+
                         const { support, resistance } = findSupportAndResistance(ohlcv15m);
                         const { pattern, score } = detectChartPatterns(ohlcv15m);
 
-                        // Taglia dell'investimento: micro-lotti (6€) se ribassista, standard (12€) se rialzista
-                        let targetInvestmentSize = isBtcBullish ? 12 : 6; 
+                        // Taglia dell'investimento: micro-lotti ultra-prudenti da 5€ in Bearish, 12€ in Bullish
+                        let targetInvestmentSize = isBtcBullish ? 12 : 5; 
                         if (eurBalance < targetInvestmentSize) targetInvestmentSize = eurBalance;
 
-                        // REGOLE DI INGRESSO SELETTIVE E BILANCIATE:
+                        // FILTRI DI INGRESSO INTELLIGENTI:
                         const nearSupport = support > 0 && (currentPrice <= support * 1.015);
-                        const realOversold = (rsi5m < 28 && rsi15m < 35); // Ipervenduto reale e profondo
-                        const strongMomentum = (rsi5m > 62 && rsi15m > 58 && currentPrice >= resistance * 0.985); // Forza / Ipercomprato sano su resistenza
+                        const strongMomentum = (rsi5m > 62 && rsi15m > 58 && currentPrice >= resistance * 0.985);
 
                         let buyCondition = false;
                         let reason = "";
 
                         if (!isBtcBullish) {
-                            if (nearSupport || realOversold) {
+                            // GIORNATA NEGATIVA / BEARISH: 
+                            // Non comprare mai in caduta libera! Richiede che sia vicino al supporto E che ci sia la candela verde di rimbalzo (isGreenBounce)
+                            if (nearSupport && isGreenBounce) {
                                 buyCondition = (eurBalance >= 5);
-                                reason = nearSupport ? "Test Supporto (Bearish)" : "Ipervenduto Reale Profondo";
+                                reason = "Rimbalzo Confermato su Supporto (Bearish Safe)";
                             }
                         } else {
+                            // GIORNATA POSITIVA / BULLISH:
                             if (strongMomentum) {
                                 buyCondition = (eurBalance >= 5);
-                                reason = `Forza / Ipercomprato su Resistenza (€${resistance.toFixed(2)})`;
-                            } else if (nearSupport || realOversold) {
+                                reason = `Forza / Breakout su Resistenza (€${resistance.toFixed(2)})`;
+                            } else if (nearSupport) {
                                 buyCondition = (eurBalance >= 5);
-                                reason = nearSupport ? "Rimbalzo da Supporto" : "Ipervenduto Reale";
+                                reason = "Rimbalzo da Supporto (Bullish)";
                             }
                         }
 
@@ -256,19 +259,19 @@ async function runBotLoop() {
                             const estimatedFeePercent = 0.005; 
                             const netTargetPrice = currentPrice * (1 + estimatedFeePercent + (dynamicTakeProfit / 100));
 
-                            console.log(`[Scansione Rotazionale] Scelto ${symbol} | Motivo: ${reason} | RSI(5m): ${rsi5m.toFixed(1)} | Supporto: €${support.toFixed(2)} | Resistenza: €${resistance.toFixed(2)} | Prezzo: €${currentPrice}`);
+                            console.log(`[Scansione Protetta] Scelto ${symbol} | Motivo: ${reason} | RSI(5m): ${rsi5m.toFixed(1)} | Supporto: €${support.toFixed(2)} | Prezzo: €${currentPrice}`);
 
                             const amountToBuy = targetInvestmentSize / currentPrice;
                             const order = await exchange.createMarketBuyOrder(symbol, amountToBuy);
                             
-                            console.log(`[SUCCESSO ACQUISTO ROTAZIONALE] Acquistati ~€${targetInvestmentSize} di ${symbol} a €${currentPrice} (${reason})! ID:`, order.id);
+                            console.log(`[SUCCESSO ACQUISTO PROTETTO] Acquistati ~€${targetInvestmentSize} di ${symbol} a €${currentPrice} (${reason})! ID:`, order.id);
                             lastLog = `[${now}] Acquistati €${targetInvestmentSize} di ${symbol} (${reason})`;
                             
                             await new Promise(resolve => setTimeout(resolve, 60000));
                             break;
                         }
                     } catch (altErr) {
-                        // Passa all'asset successivo della lista in caso di errore
+                        // Passa all'asset successivo in caso di errore
                     }
                 }
             }
