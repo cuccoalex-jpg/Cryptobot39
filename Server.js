@@ -17,7 +17,7 @@ const exchange = new ccxt.kraken({
 });
 
 let botRunning = true;
-let lastLog = "Bot avviato con la strategia integrale completa (CMC, Termometro BTC, RSI/SMA, Lotti, Commissioni, Take-Profit e Stop-Loss).";
+let lastLog = "Bot avviato con gestione integrale attiva (Acquisto, Take-Profit e Stop-Loss reali).";
 
 // Dashboard di stato su Render
 app.get('/', (req, res) => {
@@ -27,7 +27,7 @@ app.get('/', (req, res) => {
             <body style="font-family: Arial; padding: 20px; background: #111; color: #fff;">
                 <h1>Cryptobot39 - Stato: ${botRunning ? 'ATTIVO & OPERATIVO' : 'FERMO'}</h1>
                 <p><b>Ultima attività:</b> ${lastLog}</p>
-                <p><b>Strategia Integrale:</b> CoinMarketCap, Termometro BTC, RSI + SMA, Lotti Frazionati, TP & SL automatici.</p>
+                <p><b>Modalità:</b> Esecuzione reale attiva (Acquisto in ipervenduto + TP & SL automatici).</p>
             </body>
         </html>
     `);
@@ -64,32 +64,66 @@ async function runBotLoop() {
             if (botRunning) {
                 const now = new Date().toLocaleString();
                 
+                await exchange.loadMarkets();
+
                 // 1. Lettura Saldi su Kraken
                 const balance = await exchange.fetchBalance();
                 const eurBalance = balance.free['EUR'] || 0;
                 console.log(`[${now}] Saldo disponibile EUR: €${eurBalance.toFixed(2)}`);
 
-                // 2. Monitoraggio posizioni aperte (Take-Profit e Stop-Loss automatici)
-                try {
-                    const activeAssets = ['ETH/EUR', 'SOL/EUR', 'XRP/EUR', 'ADA/EUR'];
-                    for (const symbol of activeAssets) {
+                // 2. Monitoraggio posizioni aperte per Take-Profit e Stop-Loss effettivi
+                const activeAssets = ['ETH/EUR', 'SOL/EUR', 'XRP/EUR', 'ADA/EUR'];
+                for (const symbol of activeAssets) {
+                    try {
                         const baseCurrency = symbol.split('/')[0];
                         const assetBalance = balance.free[baseCurrency] || 0;
                         
-                        if (assetBalance > 0) {
+                        // Se possediamo una quantità di questo asset superiore al dust
+                        if (assetBalance > 0.0001 && exchange.markets[symbol]) {
                             const ticker = await exchange.fetchTicker(symbol);
                             const currentPrice = ticker.last;
-                            
-                            // Logica di gestione uscita (TP / SL di sicurezza)
-                            console.log(`[Monitoraggio Posizione] ${symbol} | Prezzo attuale: €${currentPrice} | Qtà: ${assetBalance}`);
+
+                            // Recupera l'ultimo prezzo di acquisto dallo storico degli scambi su Kraken
+                            let entryPrice = currentPrice; // Fallback di sicurezza
+                            try {
+                                const trades = await exchange.fetchMyTrades(symbol, undefined, 5);
+                                const buyTrades = trades.filter(t => t.side === 'buy');
+                                if (buyTrades.length > 0) {
+                                    entryPrice = buyTrades[buyTrades.length - 1].price;
+                                }
+                            } catch (tradeErr) {
+                                // Se non recupera lo storico, usa il prezzo corrente come riferimento iniziale
+                            }
+
+                            const pnlPercent = ((currentPrice - entryPrice) / entryPrice) * 100;
+                            console.log(`[Posizione Aperta] ${symbol} | Qtà: ${assetBalance} | Prezzo Ingresso: €${entryPrice.toFixed(2)} | Prezzo Attuale: €${currentPrice.toFixed(2)} | P&L: ${pnlPercent.toFixed(2)}%`);
+
+                            // Soglie di gestione rischio
+                            const takeProfitThreshold = 2.0; // +2% di utile netto target
+                            const stopLossThreshold = -4.0;  // -4% di perdita massima tollerata
+
+                            if (pnlPercent >= takeProfitThreshold) {
+                                console.log(`[TAKE-PROFIT] Raggiunto il target del +${takeProfitThreshold}% su ${symbol}! Esecuzione vendita a mercato...`);
+                                const sellOrder = await exchange.createMarketSellOrder(symbol, assetBalance);
+                                console.log(`[SUCCESSO VENDITA] Ordine TP eseguito! ID:`, sellOrder.id);
+                                lastLog = `[${now}] Take-Profit eseguito su ${symbol} con successo (+${pnlPercent.toFixed(2)}%)`;
+                                await new Promise(resolve => setTimeout(resolve, 60000));
+                                break;
+                            } else if (pnlPercent <= stopLossThreshold) {
+                                console.log(`[STOP-LOSS] Raggiunta la soglia di protezione del ${stopLossThreshold}% su ${symbol}. Chiusura posizione in corso...`);
+                                const sellOrder = await exchange.createMarketSellOrder(symbol, assetBalance);
+                                console.log(`[SUCCESSO STOP-LOSS] Ordine SL eseguito! ID:`, sellOrder.id);
+                                lastLog = `[${now}] Stop-Loss eseguito su ${symbol} (${pnlPercent.toFixed(2)}%)`;
+                                await new Promise(resolve => setTimeout(resolve, 60000));
+                                break;
+                            }
                         }
+                    } catch (posErr) {
+                        console.log(`Errore nel monitoraggio posizione su ${symbol}:`, posErr.message);
                     }
-                } catch (posErr) {
-                    console.log(`Errore nel monitoraggio posizioni:`, posErr.message);
                 }
 
                 // 3. Termometro Bitcoin Dinamico & Medie Mobili
-                let marketConditionNormal = true;
                 try {
                     const btcOhlcv = await exchange.fetchOHLCV('BTC/EUR', '1h', undefined, 30);
                     const btcCloses = btcOhlcv.map(c => c[4]);
@@ -117,16 +151,13 @@ async function runBotLoop() {
                         });
                         const cmcCoins = cmcResponse.data.data;
                         const topSymbols = cmcCoins.map(coin => `${coin.symbol}/EUR`);
-                        await exchange.loadMarkets();
                         dynamicAssets = topSymbols.filter(sym => exchange.markets[sym]);
                     } catch (cmcErr) {
-                        console.log(`[CMC] Errore chiamata CoinMarketCap (uso fallback standard):`, cmcErr.message);
+                        // Fallback sulla lista standard in caso di errore CMC
                     }
                 }
 
-                await exchange.loadMarkets();
-
-                // 5. Scansione Mercati, Indicatori Tecnici (RSI + SMA), Lotti Frazionati e Commissioni
+                // 5. Scansione Mercati, Indicatori Tecnici (RSI + SMA) e Lotti Frazionati in Acquisto
                 for (const symbol of dynamicAssets) {
                     try {
                         if (!exchange.markets[symbol]) continue;
@@ -137,27 +168,20 @@ async function runBotLoop() {
                         const currentPrice = closes[closes.length - 1];
                         const sma20 = closes.slice(-20).reduce((a, b) => a + b, 0) / 20;
 
-                        // Condizione d'ingresso: Ipervenduto (RSI < 38) o prezzo sotto la media mobile con fondi sufficienti
+                        // Condizione d'ingresso: Ipervenduto (RSI < 38) o prezzo sotto la media mobile con almeno 10€ disponibili
                         if ((rsi < 38 || currentPrice < sma20) && eurBalance >= 10) {
-                            // Lotto frazionato flessibile (es. 12€)
-                            const investmentSizeEUR = Math.min(12, eurBalance); 
-                            
-                            // Stima commissioni Kraken e calcolo target profitto netto
-                            const estimatedFeePercent = 0.005; 
-                            const minProfitTargetPercent = 0.015; 
-                            const requiredPriceForNetProfit = currentPrice * (1 + estimatedFeePercent + minProfitTargetPercent);
+                            const investmentSizeEUR = Math.min(12, eurBalance); // Lotto frazionato da 12€
 
-                            console.log(`[Segnale] ${symbol} intercettato! RSI: ${rsi.toFixed(1)} | SMA20: €${sma20.toFixed(2)} | Prezzo: €${currentPrice}. Target netto calcolato oltre le fee: €${requiredPriceForNetProfit.toFixed(4)}`);
+                            console.log(`[Segnale Acquisto] ${symbol} intercettato! RSI: ${rsi.toFixed(1)} | SMA20: €${sma20.toFixed(2)} | Prezzo: €${currentPrice}`);
 
                             const amountToBuy = investmentSizeEUR / currentPrice;
 
                             // Esecuzione ordine di acquisto reale su Kraken
                             const order = await exchange.createMarketBuyOrder(symbol, amountToBuy);
-                            console.log(`[SUCCESSO] Acquistati ~€${investmentSizeEUR} di ${symbol} a €${currentPrice}! ID Ordine:`, order.id);
+                            console.log(`[SUCCESSO ACQUISTO] Acquistati ~€${investmentSizeEUR} di ${symbol} a €${currentPrice}! ID:`, order.id);
                             
-                            lastLog = `[${now}] Acquistati €${investmentSizeEUR} di ${symbol} (RSI: ${rsi.toFixed(1)}, Target profitto attivo)`;
+                            lastLog = `[${now}] Acquistati €${investmentSizeEUR} di ${symbol} (RSI: ${rsi.toFixed(1)})`;
                             
-                            // Pausa per evitare doppie esposizioni immediate nello stesso ciclo
                             await new Promise(resolve => setTimeout(resolve, 60000));
                             break;
                         }
