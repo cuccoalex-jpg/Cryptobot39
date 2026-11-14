@@ -17,7 +17,7 @@ const exchange = new ccxt.kraken({
 });
 
 let botRunning = true;
-let lastLog = "Bot avviato con la strategia integrale sicura (Commissioni Kraken, TF Multi-Livello 5m/15m/1h, Supporti/Resistenze, Pattern, SL/TP dinamici BTC, Multi-SMA e Micro-lotti).";
+let lastLog = "Bot avviato con Scansione Completa Multi-Asset (Top CMC + Kraken, Analisi Ipercomprato/Trend, Supporti/Resistenze, Fee Kraken, SL/TP dinamici BTC).";
 
 // Dashboard di stato su Render
 app.get('/', (req, res) => {
@@ -27,7 +27,7 @@ app.get('/', (req, res) => {
             <body style="font-family: Arial; padding: 20px; background: #111; color: #fff;">
                 <h1>Cryptobot39 - Stato: ${botRunning ? 'ATTIVO & OPERATIVO' : 'FERMO'}</h1>
                 <p><b>Ultima attività:</b> ${lastLog}</p>
-                <p><b>Strategia Sicura Integrale:</b> Fee Kraken, TF Multi-Livello, Supporti/Resistenze, Pattern, SL/TP dinamici su BTC (SL: -2% neg / -5% pos, TP: +1% neg / +2% pos), Multi-SMA, Multi-Token & Micro-lotti.</p>
+                <p><b>Strategia Completa Master:</b> Scansione Totale CMC & Kraken, Analisi Ipercomprato/Forza & Supporti/Resistenze, SL/TP dinamici su BTC, Fee Check & Micro-lotti.</p>
             </body>
         </html>
     `);
@@ -64,7 +64,7 @@ function calculateSMA(closes, period) {
     return slice.reduce((a, b) => a + b, 0) / period;
 }
 
-// Rilevamento Supporti e Resistenze
+// Rilevamento Supporti e Resistenze geometriche avanzate
 function findSupportAndResistance(ohlcv) {
     if (!ohlcv || ohlcv.length < 20) return { support: 0, resistance: 0 };
     const lows = ohlcv.map(c => c[3]); 
@@ -134,8 +134,8 @@ async function runBotLoop() {
                 }
 
                 // Soglie SL e TP dinamiche basate rigorosamente sul trend di BTC
-                const dynamicStopLoss = isBtcBullish ? -5.0 : -2.0;    // -5% se positivo, -2% se negativo
-                const dynamicTakeProfit = isBtcBullish ? 2.0 : 1.0;     // +2% o più se positivo, +1% se negativo
+                const dynamicStopLoss = isBtcBullish ? -5.0 : -2.0;    
+                const dynamicTakeProfit = isBtcBullish ? 2.0 : 1.0;     
 
                 // 3. Monitoraggio posizioni aperte (TP & SL dinamici effettivi)
                 const activeAssets = ['ETH/EUR', 'SOL/EUR', 'XRP/EUR', 'ADA/EUR', 'AVAX/EUR', 'LINK/EUR'];
@@ -181,22 +181,25 @@ async function runBotLoop() {
                     }
                 }
 
-                // 4. CoinMarketCap & Multi-Token Discovery
-                let dynamicAssets = ['ETH/EUR', 'SOL/EUR', 'XRP/EUR', 'ADA/EUR', 'AVAX/EUR', 'LINK/EUR'];
+                // 4. SCANSIONE COMPLETA: Unione di tutte le crypto da CoinMarketCap + Lista nativa Kraken in EUR
+                let dynamicAssets = ['ETH/EUR', 'SOL/EUR', 'XRP/EUR', 'ADA/EUR', 'AVAX/EUR', 'LINK/EUR', 'DOT/EUR', 'MATIC/EUR', 'UNI/EUR', 'ATOM/EUR'];
                 if (CMC_API_KEY) {
                     try {
                         const cmcResponse = await axios.get('https://pro-api.coinmarketcap.com/v1/cryptocurrency/listings/latest', {
                             headers: { 'X-CMC_PRO_API_KEY': CMC_API_KEY },
-                            params: { start: 1, limit: 30, convert: 'USD' }
+                            params: { start: 1, limit: 50, convert: 'USD' }
                         });
                         const cmcCoins = cmcResponse.data.data;
                         const topSymbols = cmcCoins.map(coin => `${coin.symbol}/EUR`);
                         const validCmcAssets = topSymbols.filter(sym => exchange.markets[sym]);
-                        if (validCmcAssets.length > 0) dynamicAssets = validCmcAssets;
-                    } catch (cmcErr) {}
+                        // Unisce e rimuove i doppioni
+                        dynamicAssets = Array.from(new Set([...validCmcAssets, ...dynamicAssets]));
+                    } catch (cmcErr) {
+                        console.log("Errore recupero CoinMarketCap, uso paniere Kraken predefinito.");
+                    }
                 }
 
-                // 5. Scansione Multi-Token con Timeframe Multi-Livello (5m, 15m, 1h), Supporti, Pattern, Fee Check e Micro-lotti
+                // 5. ANALISI MASTER MASTER: Sfoglia tutto, valuta ipervenduto, ipercomprato, resistenze, supporti e momentum
                 for (const symbol of dynamicAssets) {
                     try {
                         if (!exchange.markets[symbol]) continue;
@@ -221,33 +224,50 @@ async function runBotLoop() {
                         let targetInvestmentSize = isBtcBullish ? 12 : 6; 
                         if (eurBalance < targetInvestmentSize) targetInvestmentSize = eurBalance;
 
-                        let buyCondition = false;
+                        // Condizioni di analisi completa:
                         const nearSupport = support > 0 && (currentPrice <= support * 1.015);
+                        const isOversold = (rsi5m < 30 || rsi15m < 38); // Ipervenduto
+                        
+                        // Valutazione Ipercomprato / Forza / Breakout di Resistenza
+                        const isOverboughtStrong = (rsi5m > 65 && rsi15m > 60 && currentPrice >= resistance * 0.99); // In ipercomprato vicino alla resistenza o in pieno breakout
+
+                        let buyCondition = false;
+                        let reason = "";
 
                         if (!isBtcBullish) {
-                            buyCondition = (nearSupport || rsi5m < 28 || rsi15m < 35 || score >= 2) && eurBalance >= 5;
+                            // In mercato ribassista predilige i supporti e l'ipervenduto
+                            if (nearSupport || isOversold || score >= 2) {
+                                buyCondition = (eurBalance >= 5);
+                                reason = nearSupport ? "Test Supporto (Bearish)" : "Ipervenduto Profondo";
+                            }
                         } else {
-                            buyCondition = (nearSupport || rsi5m < 38 || currentPrice < sma20_1h) && eurBalance >= 5;
+                            // In mercato rialzista cerca tutto: ipervenduto, supporti, ma ANALIZZA ANCHE GLI IPERCOMPRATI E I BREAKOUT DI RESISTENZA!
+                            if (isOverboughtStrong) {
+                                buyCondition = (eurBalance >= 5);
+                                reason = `Ipercomprato in Breakout su Resistenza (€${resistance.toFixed(2)})`;
+                            } else if (nearSupport || isOversold) {
+                                buyCondition = (eurBalance >= 5);
+                                reason = nearSupport ? "Rimbalzo da Supporto" : "Ipervenduto a Sconto";
+                            }
                         }
 
                         if (buyCondition) {
-                            // CALCOLO COMMISSIONI KRAKEN E VERIFICA TARGET NETTO
-                            const estimatedFeePercent = 0.005; // 0.5% stima round-trip fee
+                            const estimatedFeePercent = 0.005; 
                             const netTargetPrice = currentPrice * (1 + estimatedFeePercent + (dynamicTakeProfit / 100));
 
-                            console.log(`[Segnale Sicuro] ${symbol} | Pattern: ${pattern} | Supporto: €${support.toFixed(2)} | RSI(5m): ${rsi5m.toFixed(1)} | Prezzo: €${currentPrice} | Target Netto (fee incl.): €${netTargetPrice.toFixed(4)}`);
+                            console.log(`[Analisi Master] Trovata opportunità su ${symbol} | Motivo: ${reason} | RSI(5m): ${rsi5m.toFixed(1)} | Supporto: €${support.toFixed(2)} | Resistenza: €${resistance.toFixed(2)} | Prezzo: €${currentPrice} | Target Netto: €${netTargetPrice.toFixed(4)}`);
 
                             const amountToBuy = targetInvestmentSize / currentPrice;
                             const order = await exchange.createMarketBuyOrder(symbol, amountToBuy);
                             
-                            console.log(`[SUCCESSO ACQUISTO] Acquistati ~€${targetInvestmentSize} di ${symbol} a €${currentPrice}! ID:`, order.id);
-                            lastLog = `[${now}] Acquistati €${targetInvestmentSize} di ${symbol} (Fee & Target verificati)`;
+                            console.log(`[SUCCESSO ACQUISTO MASTER] Acquistati ~€${targetInvestmentSize} di ${symbol} a €${currentPrice} (${reason})! ID:`, order.id);
+                            lastLog = `[${now}] Acquistati €${targetInvestmentSize} di ${symbol} (${reason})`;
                             
                             await new Promise(resolve => setTimeout(resolve, 60000));
                             break;
                         }
                     } catch (altErr) {
-                        // Prosegue la scansione sugli altri token in caso di errore sul singolo asset
+                        // Salta l'asset in caso di errore temporaneo e continua la scansione sugli altri
                     }
                 }
             }
