@@ -1,13 +1,14 @@
 {
-  "name": "cryptoguard-backend",
-  "version": "1.0.0",
-  "description": "Autonomous trading backend for Kraken Pro",
-  "main": "server.js",
+  "name": "cryptobot39",
+  "version": "2.0.0",
+  "description": "Autonomous Kraken Multi-Asset Trading Engine",
+  "main": "Server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node Server.js"
   },
   "dependencies": {
-    "axios": "^1.6.0",
-    "express": "^4.19.2"
+    "axios": "^1.7.7",
+    "ccxt": "^4.4.25",
+    "express": "^4.21.1"
   }
 }
