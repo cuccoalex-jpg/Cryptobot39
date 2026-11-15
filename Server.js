@@ -17,7 +17,7 @@ const exchange = new ccxt.kraken({
 });
 
 let botRunning = true;
-let lastLog = "Bot avviato: Risk Gate + Backtest Storico Prezzi + Watchlist Outperformer + Panic Switch.";
+let lastLog = "Bot avviato: Confluenza Tecnica Totale (MACD + Bollinger + Stocastico + Momentum + RSI + Medie Mobili + Fibonacci) + TP Ottimizzato.";
 
 let watchedOutperformers = [];
 
@@ -40,6 +40,8 @@ app.post('/api/toggle', (req, res) => {
     res.json({ success: true, botRunning, message: lastLog });
 });
 
+// --- INDICATORI TECNICI AVANZATI A 360° ---
+
 function calculateRSI(closes, period = 14) {
     if (!closes || closes.length < period + 1) return 50;
     let gains = 0;
@@ -60,6 +62,78 @@ function calculateSMA(closes, period) {
     if (!closes || closes.length < period) return closes ? closes[closes.length - 1] : 0;
     const slice = closes.slice(-period);
     return slice.reduce((a, b) => a + b, 0) / period;
+}
+
+function calculateEMA(closes, period) {
+    if (!closes || closes.length === 0) return 0;
+    const k = 2 / (period + 1);
+    let ema = closes[0];
+    for (let i = 1; i < closes.length; i++) {
+        ema = (closes[i] * k) + (ema * (1 - k));
+    }
+    return ema;
+}
+
+// MACD (Moving Average Convergence Divergence)
+function calculateMACD(closes) {
+    if (!closes || closes.length < 35) return { macd: 0, signal: 0, histogram: 0 };
+    const fastEMA = calculateEMA(closes, 12);
+    const slowEMA = calculateEMA(closes, 26);
+    const macd = fastEMA - slowEMA;
+    const prevFast = calculateEMA(closes.slice(0, -1), 12);
+    const prevSlow = calculateEMA(closes.slice(0, -1), 26);
+    const prevMacd = prevFast - prevSlow;
+    const signal = (macd * (2 / 10)) + (prevMacd * (8 / 10));
+    const histogram = macd - signal;
+    return { macd, signal, histogram };
+}
+
+// BANDE DI BOLLINGER
+function calculateBollingerBands(closes, period = 20, stdDevMultiplier = 2) {
+    if (!closes || closes.length < period) return { upper: 0, middle: 0, lower: 0 };
+    const slice = closes.slice(-period);
+    const middle = slice.reduce((a, b) => a + b, 0) / period;
+    const variance = slice.reduce((sum, val) => sum + Math.pow(val - middle, 2), 0) / period;
+    const stdDev = Math.sqrt(variance);
+    return {
+        upper: middle + (stdDevMultiplier * stdDev),
+        middle: middle,
+        lower: middle - (stdDevMultiplier * stdDev)
+    };
+}
+
+// MOMENTUM
+function calculateMomentum(closes, period = 10) {
+    if (!closes || closes.length <= period) return 0;
+    return closes[closes.length - 1] - closes[closes.length - 1 - period];
+}
+
+// OSCILLATORE STOCASTICO
+function calculateStochastic(ohlcv, period = 14) {
+    if (!ohlcv || ohlcv.length < period) return { k: 50, d: 50 };
+    const slice = ohlcv.slice(-period);
+    const currentClose = slice[slice.length - 1][4];
+    const lowestLow = Math.min(...slice.map(c => c[3]));
+    const highestHigh = Math.max(...slice.map(c => c[2]));
+    if (highestHigh === lowestLow) return { k: 50, d: 50 };
+    const k = ((currentClose - lowestLow) / (highestHigh - lowestLow)) * 100;
+    return { k, d: k };
+}
+
+// FIBONACCI RETRACEMENT
+function calculateFibonacciLevels(ohlcv) {
+    if (!ohlcv || ohlcv.length < 30) return { fib382: 0, fib500: 0, fib618: 0 };
+    const highs = ohlcv.map(c => c[2]);
+    const lows = ohlcv.map(c => c[3]);
+    const maxHigh = Math.max(...highs.slice(-30));
+    const minLow = Math.min(...lows.slice(-30));
+    const diff = maxHigh - minLow;
+
+    return {
+        fib382: maxHigh - (diff * 0.382),
+        fib500: maxHigh - (diff * 0.500),
+        fib618: maxHigh - (diff * 0.618)
+    };
 }
 
 function findSupportAndResistance(ohlcv) {
@@ -98,17 +172,15 @@ async function getMacroSentiment() {
     }
 }
 
-// BACKTEST GEOMETRICO STORICO SUI PREZZI: Simula se in passato comprare a questo livello portava a profitto o stop-loss
 async function backtestPriceLevel(ohlcv, targetPrice, takeProfitPct, stopLossPct) {
     if (!ohlcv || ohlcv.length < 30) return { winRate: 100, status: "PASSED" };
     
     let simulatedWins = 0;
     let simulatedLosses = 0;
 
-    // Analizza lo storico candela per candela per vedere come si muoveva il prezzo partendo da livelli simili
     for (let i = 20; i < ohlcv.length - 5; i++) {
-        const historicalEntry = ohlcv[i][4]; // Prezzo di chiusura della candela passata
-        const futureCandles = ohlcv.slice(i + 1, i + 6); // Guarda le 5 candele successive
+        const historicalEntry = ohlcv[i][4]; 
+        const futureCandles = ohlcv.slice(i + 1, i + 6); 
 
         let hitTP = false;
         let hitSL = false;
@@ -131,7 +203,6 @@ async function backtestPriceLevel(ohlcv, targetPrice, takeProfitPct, stopLossPct
     if (totalSims === 0) return { winRate: 100, status: "PASSED" };
 
     const winRate = (simulatedWins / totalSims) * 100;
-    // Se lo storico di quel livello di prezzo ha una percentuale di successo inferiore al 40%, penalizza l'ingresso
     if (winRate < 40) {
         return { winRate, status: "PENALIZED" };
     }
@@ -150,7 +221,7 @@ async function runBotLoop() {
                 const eurBalance = balance.free['EUR'] || 0;
                 console.log(`[${now}] Saldo disponibile EUR: €${eurBalance.toFixed(2)}`);
 
-                // 2. Termometro BTC & Macro (Visibile nei log)
+                // 2. Termometro BTC & Macro
                 const macro = await getMacroSentiment();
                 let isBtcBullish = true;
                 let isPanicCrash = false;
@@ -171,16 +242,17 @@ async function runBotLoop() {
                     isBtcBullish = (btcPrice >= btcSma20 && btcRsi15m >= 45);
                     isPanicCrash = (btcChange1h <= -4.0) || (btcChange1h <= -3.0 && macro.isExtremeFear);
 
-                    lastLog = `[${now}] 📊 Termometro BTC: €${btcPrice.toFixed(2)} | Variazione 1h: ${btcChange1h.toFixed(2)}% | RSI: ${btcRsi15m.toFixed(1)} | Stato: ${isPanicCrash ? '🚨 PANIC CRASH' : (isBtcBullish ? 'BULLISH' : 'BEARISH')}`;
+                    lastLog = `[${now}] 📊 Termometro BTC: €${btcPrice.toFixed(2)} | Variazione 1h: ${btcChange1h.toFixed(2)}% | RSI: ${btcRsi15m.toFixed(1)} | Stato: ${isPanicCrash ? '🚨 PANIC' : (isBtcBullish ? 'BULLISH' : 'BEARISH')}`;
                     console.log(lastLog);
                 } catch (btcErr) {
                     console.log(`[${now}] ⚠️ Errore lettura termometro BTC:`, btcErr.message);
                 }
 
+                // Take-Profit ottimizzato e Stop-Loss dinamici
                 const dynamicStopLoss = isBtcBullish ? -5.0 : -2.0;    
-                const dynamicTakeProfit = isBtcBullish ? 2.0 : 1.0;     
+                const dynamicTakeProfit = isBtcBullish ? 1.4 : 1.0;     
 
-                // 3. Scansione CoinMarketCap & Top Gainer (Volumi 24h)
+                // 3. Scansione CoinMarketCap & Top Gainer
                 let allKrakenPairs = Object.keys(exchange.markets).filter(symbol => symbol.endsWith('/EUR') && exchange.markets[symbol].active);
                 let dynamicAssets = allKrakenPairs;
                 let cmcPerformanceMap = {};
@@ -198,13 +270,13 @@ async function runBotLoop() {
                             topSymbols.push(sym);
                             cmcPerformanceMap[sym] = coin.quote?.USD?.percent_change_24h || 0;
                         }
-                        const validCmcAssets = topSymbols.filter(sym => exchange.markets[sym] && exchange.markets[symbol]?.active);
+                        const validCmcAssets = topSymbols.filter(sym => exchange.markets[sym] && exchange.markets[sym].active);
                         const remainingPairs = allKrakenPairs.filter(sym => !validCmcAssets.includes(sym));
                         dynamicAssets = [...validCmcAssets, ...remainingPairs];
                     } catch (e) {}
                 }
 
-                // 4. Monitoraggio Globale Portafoglio (DOT, ATOM, ecc.)
+                // 4. Monitoraggio Globale Portafoglio
                 const totalBalances = balance.total || {};
                 for (const currency of Object.keys(totalBalances)) {
                     if (currency === 'EUR' || currency === 'ZEUR' || currency === 'KFEE') continue;
@@ -241,7 +313,7 @@ async function runBotLoop() {
                                     break;
                                 } else {
                                     console.log(`[🛡️ VINCENTE PROTETTA] ${symbol} regge a +${pnlPercent.toFixed(2)}%.`);
-                                    if (pnlPercent >= dynamicTakeProfit + 1.5) {
+                                    if (pnlPercent >= dynamicTakeProfit + 1.2) {
                                         await exchange.createMarketSellOrder(symbol, freeAmount);
                                         break;
                                     }
@@ -269,7 +341,7 @@ async function runBotLoop() {
                     }
                 }
 
-                // 5. RISK GATE & SCANSIONE ACQUISTI (Con Backtest Storico Prezzi + Diagnostica nei Log)
+                // 5. CONFLUENZA TECNICA TOTALE & SCANSIONE ACQUISTI
                 let prioritizedAssets = [...new Set([...watchedOutperformers, ...dynamicAssets])];
 
                 for (const symbol of prioritizedAssets) {
@@ -284,58 +356,81 @@ async function runBotLoop() {
 
                         const perf24h = cmcPerformanceMap[symbol] || 0;
                         if (isPanicCrash && perf24h < 4.5 && !watchedOutperformers.includes(symbol)) {
-                            console.log(`[Risk Gate] ${symbol} scartato: crollo di mercato in corso e performance 24h insufficiente.`);
                             continue;
                         }
 
-                        const ohlcv5m = await exchange.fetchOHLCV(symbol, '5m', undefined, 30);
-                        const ohlcv15m = await exchange.fetchOHLCV(symbol, '15m', undefined, 30);
+                        // Raccolta dati multi-timeframe
+                        const ohlcv5m = await exchange.fetchOHLCV(symbol, '5m', undefined, 50);
+                        const ohlcv15m = await exchange.fetchOHLCV(symbol, '15m', undefined, 50);
                         const closes5m = ohlcv5m.map(c => c[4]);
                         const closes15m = ohlcv15m.map(c => c[4]);
 
-                        const rsi5m = calculateRSI(closes5m, 14);
-                        const rsi15m = calculateRSI(closes15m, 14);
                         const currentPrice = closes5m[closes5m.length - 1];
 
-                        // Esegue il backtest geometrico storico sul livello di prezzo attuale
-                        const backtest = await backtestPriceLevel(ohlcv15m, currentPrice, dynamicTakeProfit, Math.abs(dynamicStopLoss));
-                        if (backtest.status === "PENALIZED") {
-                            console.log(`[Risk Gate / Backtest] ${symbol} scartato: storico sfavorevole a questo livello di prezzo (WinRate stimato: ${backtest.winRate.toFixed(1)}%).`);
-                            continue;
-                        }
+                        // --- ESTRAZIONE DI TUTTI GLI INDICATORI TECNICI ESISTENTI ---
+                        const rsi5m = calculateRSI(closes5m, 14);
+                        const rsi15m = calculateRSI(closes15m, 14);
+                        const sma20 = calculateSMA(closes15m, 20);
+                        const sma50 = calculateSMA(closes15m, 50);
+                        const macdData = calculateMACD(closes15m); // MACD Line, Signal, Histogram
+                        const bollinger = calculateBollingerBands(closes15m, 20, 2); // Upper, Middle, Lower
+                        const momentum = calculateMomentum(closes5m, 10); // Momentum
+                        const stochastic = calculateStochastic(ohlcv5m, 14); // %K e %D Stocastico
+                        const fib = calculateFibonacciLevels(ohlcv15m); // Fibonacci 382, 500, 618
+                        const { support } = findSupportAndResistance(ohlcv15m); // Supporto geometrico
+                        const { isGreenCandle } = detectChartPatterns(ohlcv5m); // Candela verde
 
-                        const { support } = findSupportAndResistance(ohlcv15m);
-                        const { isGreenCandle } = detectChartPatterns(ohlcv5m);
+                        // Backtest storico geometrico
+                        const backtest = await backtestPriceLevel(ohlcv15m, currentPrice, dynamicTakeProfit, Math.abs(dynamicStopLoss));
+                        if (backtest.status === "PENALIZED") continue;
 
                         let targetInvestmentSize = (isBtcBullish && !macro.isExtremeFear && !isPanicCrash) ? 12 : 5; 
                         if (eurBalance < targetInvestmentSize) targetInvestmentSize = eurBalance;
 
-                        if (!isGreenCandle) {
-                            console.log(`[Diagnostica] ${symbol} saltato: nessuna conferma geometrica di candela verde a 5m.`);
-                            continue;
-                        }
+                        // Condizione fondamentale: la candela attuale deve essere verde
+                        if (!isGreenCandle) continue;
 
+                        // --- REGOLE DI CONFLUENZA MASSIMA ---
                         const isWatchedOutperformer = watchedOutperformers.includes(symbol);
-                        const nearSupport = support > 0 && (currentPrice <= support * 1.02);
-                        const isOversold = (rsi5m < 34 || rsi15m < 38);
-                        const strongMomentum = (rsi5m > 56 && rsi5m < 72 && rsi15m > 52);
+                        
+                        // 1. Trend di fondo OK (SMA / EMA)
+                        const trendOk = (currentPrice >= sma20 || currentPrice >= sma50);
+                        
+                        // 2. MACD Positivo o in spinta (Histogram > 0)
+                        const macdOk = (macdData.histogram >= 0 || macdData.macd > macdData.signal);
+
+                        // 3. Posizione su Bollinger Lower Band o Supporto / Fibonacci
+                        const levelOk = (
+                            currentPrice <= bollinger.lower * 1.015 ||
+                            (support > 0 && currentPrice <= support * 1.02) ||
+                            Math.abs(currentPrice - fib.fib618) / fib.fib618 < 0.015 ||
+                            Math.abs(currentPrice - fib.fib500) / fib.fib500 < 0.015 ||
+                            Math.abs(currentPrice - fib.fib382) / fib.fib382 < 0.015
+                        );
+
+                        // 4. Oscillatori sani (RSI e Stocastico)
+                        const oscillatorsOk = (rsi5m >= 32 && rsi5m <= 70 && stochastic.k < 75);
+
+                        // 5. Momentum positivo
+                        const momentumOk = (momentum >= 0);
 
                         let buyCondition = false;
                         let reason = "";
 
                         if (isWatchedOutperformer) {
-                            buyCondition = (eurBalance >= 5);
-                            reason = `Reingresso Outperformer (Backtest Storico OK - ${perf24h.toFixed(1)}% 24h)`;
+                            buyCondition = (eurBalance >= 5 && trendOk && macdOk);
+                            reason = `Reingresso Outperformer (Confluenza Totale - ${perf24h.toFixed(1)}% 24h)`;
                             watchedOutperformers = watchedOutperformers.filter(s => s !== symbol);
                         } else if (!isPanicCrash) {
-                            if (strongMomentum || nearSupport || isOversold) {
+                            // Richiede la confluenza rigorosa di TUTTI i blocchi tecnici insieme
+                            if (trendOk && macdOk && levelOk && oscillatorsOk && momentumOk) {
                                 buyCondition = (eurBalance >= 5);
-                                reason = strongMomentum ? "Slancio Top Gainer (Backtest OK)" : "Supporto Confermato (Backtest OK)";
+                                reason = "Confluenza Totale (SMA + MACD + Bollinger + Stocastico + Fib/Supporto + Momentum + RSI)";
                             }
                         }
 
                         if (buyCondition) {
-                            console.log(`[Risk Gate Passato] Acquistabile ${symbol} | Motivo: ${reason} | WinRate storico stimato: ${backtest.winRate.toFixed(1)}% | Prezzo: €${currentPrice}`);
+                            console.log(`[Acquisto Confluente] Trovata occasione su ${symbol} | Motivo: ${reason} | Prezzo: €${currentPrice}`);
                             const amountToBuy = targetInvestmentSize / currentPrice;
                             const order = await exchange.createMarketBuyOrder(symbol, amountToBuy);
                             console.log(`[SUCCESSO ACQUISTO] Acquistati ~€${targetInvestmentSize} di ${symbol}! ID:`, order.id);
