@@ -17,7 +17,7 @@ const exchange = new ccxt.kraken({
 });
 
 let botRunning = true;
-let lastLog = "Bot avviato: Confluenza Tecnica Totale (MACD + Bollinger + Stocastico + Momentum + RSI + Medie Mobili + Fibonacci) + TP Ottimizzato.";
+let lastLog = "Bot avviato: Sistema a Punteggio di Confluenza Tecnica + Diagnostica Attiva + TP Ottimizzato.";
 
 let watchedOutperformers = [];
 
@@ -40,7 +40,7 @@ app.post('/api/toggle', (req, res) => {
     res.json({ success: true, botRunning, message: lastLog });
 });
 
-// --- INDICATORI TECNICI AVANZATI A 360° ---
+// --- INDICATORI TECNICI ---
 
 function calculateRSI(closes, period = 14) {
     if (!closes || closes.length < period + 1) return 50;
@@ -74,7 +74,6 @@ function calculateEMA(closes, period) {
     return ema;
 }
 
-// MACD (Moving Average Convergence Divergence)
 function calculateMACD(closes) {
     if (!closes || closes.length < 35) return { macd: 0, signal: 0, histogram: 0 };
     const fastEMA = calculateEMA(closes, 12);
@@ -88,7 +87,6 @@ function calculateMACD(closes) {
     return { macd, signal, histogram };
 }
 
-// BANDE DI BOLLINGER
 function calculateBollingerBands(closes, period = 20, stdDevMultiplier = 2) {
     if (!closes || closes.length < period) return { upper: 0, middle: 0, lower: 0 };
     const slice = closes.slice(-period);
@@ -102,13 +100,11 @@ function calculateBollingerBands(closes, period = 20, stdDevMultiplier = 2) {
     };
 }
 
-// MOMENTUM
 function calculateMomentum(closes, period = 10) {
     if (!closes || closes.length <= period) return 0;
     return closes[closes.length - 1] - closes[closes.length - 1 - period];
 }
 
-// OSCILLATORE STOCASTICO
 function calculateStochastic(ohlcv, period = 14) {
     if (!ohlcv || ohlcv.length < period) return { k: 50, d: 50 };
     const slice = ohlcv.slice(-period);
@@ -120,7 +116,6 @@ function calculateStochastic(ohlcv, period = 14) {
     return { k, d: k };
 }
 
-// FIBONACCI RETRACEMENT
 function calculateFibonacciLevels(ohlcv) {
     if (!ohlcv || ohlcv.length < 30) return { fib382: 0, fib500: 0, fib618: 0 };
     const highs = ohlcv.map(c => c[2]);
@@ -248,7 +243,6 @@ async function runBotLoop() {
                     console.log(`[${now}] ⚠️ Errore lettura termometro BTC:`, btcErr.message);
                 }
 
-                // Take-Profit ottimizzato e Stop-Loss dinamici
                 const dynamicStopLoss = isBtcBullish ? -5.0 : -2.0;    
                 const dynamicTakeProfit = isBtcBullish ? 1.4 : 1.0;     
 
@@ -336,12 +330,12 @@ async function runBotLoop() {
                                 break;
                             }
                         } catch (errPort) {
-                            console.log(`Errore portafoglio ${symbol}:`, errPort.message);
+                            console.log(`Error portafoglio ${symbol}:`, errPort.message);
                         }
                     }
                 }
 
-                // 5. CONFLUENZA TECNICA TOTALE & SCANSIONE ACQUISTI
+                // 5. SCANSIONE ATTIVA CON SISTEMA A PUNTEGGIO DI CONFLUENZA E DIAGNOSTICA NEI LOG
                 let prioritizedAssets = [...new Set([...watchedOutperformers, ...dynamicAssets])];
 
                 for (const symbol of prioritizedAssets) {
@@ -359,7 +353,6 @@ async function runBotLoop() {
                             continue;
                         }
 
-                        // Raccolta dati multi-timeframe
                         const ohlcv5m = await exchange.fetchOHLCV(symbol, '5m', undefined, 50);
                         const ohlcv15m = await exchange.fetchOHLCV(symbol, '15m', undefined, 50);
                         const closes5m = ohlcv5m.map(c => c[4]);
@@ -367,76 +360,88 @@ async function runBotLoop() {
 
                         const currentPrice = closes5m[closes5m.length - 1];
 
-                        // --- ESTRAZIONE DI TUTTI GLI INDICATORI TECNICI ESISTENTI ---
+                        // Estrazione indicatori
                         const rsi5m = calculateRSI(closes5m, 14);
                         const rsi15m = calculateRSI(closes15m, 14);
                         const sma20 = calculateSMA(closes15m, 20);
                         const sma50 = calculateSMA(closes15m, 50);
-                        const macdData = calculateMACD(closes15m); // MACD Line, Signal, Histogram
-                        const bollinger = calculateBollingerBands(closes15m, 20, 2); // Upper, Middle, Lower
-                        const momentum = calculateMomentum(closes5m, 10); // Momentum
-                        const stochastic = calculateStochastic(ohlcv5m, 14); // %K e %D Stocastico
-                        const fib = calculateFibonacciLevels(ohlcv15m); // Fibonacci 382, 500, 618
-                        const { support } = findSupportAndResistance(ohlcv15m); // Supporto geometrico
-                        const { isGreenCandle } = detectChartPatterns(ohlcv5m); // Candela verde
+                        const macdData = calculateMACD(closes15m);
+                        const bollinger = calculateBollingerBands(closes15m, 20, 2);
+                        const momentum = calculateMomentum(closes5m, 10);
+                        const stochastic = calculateStochastic(ohlcv5m, 14);
+                        const fib = calculateFibonacciLevels(ohlcv15m);
+                        const { support } = findSupportAndResistance(ohlcv15m);
+                        const { isGreenCandle } = detectChartPatterns(ohlcv5m);
 
-                        // Backtest storico geometrico
+                        // Backtest storico
                         const backtest = await backtestPriceLevel(ohlcv15m, currentPrice, dynamicTakeProfit, Math.abs(dynamicStopLoss));
-                        if (backtest.status === "PENALIZED") continue;
+                        if (backtest.status === "PENALIZED") {
+                            console.log(`[Diagnostica] ${symbol} saltato: backtest storico sfavorevole.`);
+                            continue;
+                        }
 
                         let targetInvestmentSize = (isBtcBullish && !macro.isExtremeFear && !isPanicCrash) ? 12 : 5; 
                         if (eurBalance < targetInvestmentSize) targetInvestmentSize = eurBalance;
 
-                        // Condizione fondamentale: la candela attuale deve essere verde
-                        if (!isGreenCandle) continue;
+                        if (!isGreenCandle) {
+                            console.log(`[Diagnostica] ${symbol} saltato: nessuna candela verde confermata a 5m.`);
+                            continue;
+                        }
 
-                        // --- REGOLE DI CONFLUENZA MASSIMA ---
-                        const isWatchedOutperformer = watchedOutperformers.includes(symbol);
-                        
-                        // 1. Trend di fondo OK (SMA / EMA)
+                        // --- SISTEMA A PUNTEGGIO DI CONFLUENZA (Confluence Score) ---
+                        let confluenceScore = 0;
+                        let reasonsList = [];
+
                         const trendOk = (currentPrice >= sma20 || currentPrice >= sma50);
-                        
-                        // 2. MACD Positivo o in spinta (Histogram > 0)
-                        const macdOk = (macdData.histogram >= 0 || macdData.macd > macdData.signal);
+                        if (trendOk) { confluenceScore++; reasonsList.push("SMA OK"); }
 
-                        // 3. Posizione su Bollinger Lower Band o Supporto / Fibonacci
+                        const macdOk = (macdData.histogram >= 0 || macdData.macd > macdData.signal);
+                        if (macdOk) { confluenceScore++; reasonsList.push("MACD OK"); }
+
                         const levelOk = (
                             currentPrice <= bollinger.lower * 1.015 ||
                             (support > 0 && currentPrice <= support * 1.02) ||
-                            Math.abs(currentPrice - fib.fib618) / fib.fib618 < 0.015 ||
-                            Math.abs(currentPrice - fib.fib500) / fib.fib500 < 0.015 ||
-                            Math.abs(currentPrice - fib.fib382) / fib.fib382 < 0.015
+                            Math.abs(currentPrice - fib.fib618) / fib.fib618 < 0.02 ||
+                            Math.abs(currentPrice - fib.fib500) / fib.fib500 < 0.02 ||
+                            Math.abs(currentPrice - fib.fib382) / fib.fib382 < 0.02
                         );
+                        if (levelOk) { confluenceScore++; reasonsList.push("Supporto/Fib/Bollinger OK"); }
 
-                        // 4. Oscillatori sani (RSI e Stocastico)
-                        const oscillatorsOk = (rsi5m >= 32 && rsi5m <= 70 && stochastic.k < 75);
+                        const oscillatorsOk = (rsi5m >= 30 && rsi5m <= 72 && stochastic.k < 80);
+                        if (oscillatorsOk) { confluenceScore++; reasonsList.push("RSI/Stocastico OK"); }
 
-                        // 5. Momentum positivo
                         const momentumOk = (momentum >= 0);
+                        if (momentumOk) { confluenceScore++; reasonsList.push("Momentum OK"); }
 
+                        const isWatchedOutperformer = watchedOutperformers.includes(symbol);
+                        
                         let buyCondition = false;
                         let reason = "";
 
                         if (isWatchedOutperformer) {
-                            buyCondition = (eurBalance >= 5 && trendOk && macdOk);
-                            reason = `Reingresso Outperformer (Confluenza Totale - ${perf24h.toFixed(1)}% 24h)`;
-                            watchedOutperformers = watchedOutperformers.filter(s => s !== symbol);
-                        } else if (!isPanicCrash) {
-                            // Richiede la confluenza rigorosa di TUTTI i blocchi tecnici insieme
-                            if (trendOk && macdOk && levelOk && oscillatorsOk && momentumOk) {
+                            if (confluenceScore >= 3) {
                                 buyCondition = (eurBalance >= 5);
-                                reason = "Confluenza Totale (SMA + MACD + Bollinger + Stocastico + Fib/Supporto + Momentum + RSI)";
+                                reason = `Reingresso Outperformer (Score: ${confluenceScore}/5 - ${reasonsList.join(', ')})`;
+                                watchedOutperformers = watchedOutperformers.filter(s => s !== symbol);
+                            }
+                        } else if (!isPanicCrash) {
+                            // Richiede almeno 4 indicatori su 5 d'accordo in contemporanea (ottima confluenza senza blocco totale)
+                            if (confluenceScore >= 4) {
+                                buyCondition = (eurBalance >= 5);
+                                reason = `Confluenza Tecnica Alta (Score: ${confluenceScore}/5 - ${reasonsList.join(', ')})`;
                             }
                         }
 
                         if (buyCondition) {
-                            console.log(`[Acquisto Confluente] Trovata occasione su ${symbol} | Motivo: ${reason} | Prezzo: €${currentPrice}`);
+                            console.log(`[ACQUISTO CONFLUENTE] Trovata occasione su ${symbol} | Motivo: ${reason} | Prezzo: €${currentPrice}`);
                             const amountToBuy = targetInvestmentSize / currentPrice;
                             const order = await exchange.createMarketBuyOrder(symbol, amountToBuy);
                             console.log(`[SUCCESSO ACQUISTO] Acquistati ~€${targetInvestmentSize} di ${symbol}! ID:`, order.id);
                             lastLog = `[${now}] Acquistati €${targetInvestmentSize} di ${symbol} (${reason})`;
                             await new Promise(resolve => setTimeout(resolve, 30000));
                             break;
+                        } else {
+                            console.log(`[Diagnostica] ${symbol} scartato: Score confluenza insufficiente (${confluenceScore}/5).`);
                         }
                     } catch (altErr) {}
                 }
