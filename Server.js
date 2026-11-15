@@ -228,6 +228,7 @@ async function runBotLoop() {
                     
                     const btcCloses4h = btcOhlcv4h.map(c => c[4]);
                     const btcCloses1h = btcOhlcv1h.map(c => c[4]);
+                    const btcCloses15m = btcOhlcv15m.map(c => c[4]);
                     
                     btcPrice = btcCloses15m[btcCloses15m.length - 1];
                     
@@ -330,7 +331,6 @@ async function runBotLoop() {
                 // 4. SCANSIONE ATTIVA CON COINMARKETCAP TOP MOVERS & RANGE LATERALE
                 let allKrakenPairs = Object.keys(exchange.markets).filter(symbol => symbol.endsWith('/EUR') && exchange.markets[symbol].active);
                 
-                // Interroghiamo CoinMarketCap per prendere i veri Top Gainers del momento
                 let cmcTopMovers = [];
                 if (CMC_API_KEY) {
                     try {
@@ -352,7 +352,6 @@ async function runBotLoop() {
                     }
                 }
 
-                // Uniamo i top movers di CMC alle coppie principali di Kraken per massima reattività
                 let prioritizedAssets = [...new Set([...watchedOutperformers, ...cmcTopMovers, ...allKrakenPairs.slice(0, 25)])];
 
                 for (const symbol of prioritizedAssets) {
@@ -437,7 +436,6 @@ async function runBotLoop() {
 
 app.listen(PORT, () => {
     console.log(`Server in ascolto sulla porta ${PORT}`);
-    // Ritardo di 3 secondi per evitare il timeout della porta su Render
     setTimeout(() => {
         runBotLoop();
     }, 3000);
