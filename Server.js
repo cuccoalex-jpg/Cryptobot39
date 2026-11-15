@@ -17,7 +17,7 @@ const exchange = new ccxt.kraken({
 });
 
 let botRunning = true;
-let lastLog = "Bot avviato: Scansione e monitoraggio totale e dinamico su tutte le coppie crypto (Senza limiti fissi, gestione automatica di qualsiasi asset aperto).";
+let lastLog = "Bot avviato: Scansione dinamica totale + Ordinamento per Top Performers (Migliori della giornata) + Monitoraggio Globale e Gestione Rischio BTC.";
 
 // Dashboard di stato su Render
 app.get('/', (req, res) => {
@@ -27,7 +27,7 @@ app.get('/', (req, res) => {
             <body style="font-family: Arial; padding: 20px; background: #111; color: #fff;">
                 <h1>Cryptobot39 - Stato: ${botRunning ? 'ATTIVO & OPERATIVO' : 'FERMO'}</h1>
                 <p><b>Ultima attività:</b> ${lastLog}</p>
-                <p><b>Strategia Totale:</b> Scansione universale su tutto il mercato, monitoraggio automatico di qualsiasi asset in portafoglio (DOT, ATOM, ecc.) e operatività elastica.</p>
+                <p><b>Strategia Dinamica Avanzata:</b> Cerca i top gainer di giornata uniti all'analisi dei supporti, monitoraggio globale di qualsiasi asset in portafoglio e operatività elastica.</p>
             </body>
         </html>
     `);
@@ -137,21 +137,19 @@ async function runBotLoop() {
                 const dynamicStopLoss = isBtcBullish ? -5.0 : -2.0;    
                 const dynamicTakeProfit = isBtcBullish ? 2.0 : 1.0;     
 
-                // 3. COSTRUZIONE DINAMICA DEL PANIERE DI SCANSIONE E MONITORAGGIO
-                // Raccoglie TUTTE le coppie in EUR disponibili su Kraken
+                // 3. COSTRUZIONE DINAMICA E ORDINAMENTO PER "TOP PERFORMERS" (Migliori della giornata)
                 let allKrakenPairs = Object.keys(exchange.markets).filter(symbol => symbol.endsWith('/EUR') && exchange.markets[symbol].active);
-
-                // Se abbiamo la chiave di CoinMarketCap, filtriamo e ordiniamo in base ai top token mondiali
                 let dynamicAssets = allKrakenPairs;
+
                 if (CMC_API_KEY) {
                     try {
                         const cmcResponse = await axios.get('https://pro-api.coinmarketcap.com/v1/cryptocurrency/listings/latest', {
                             headers: { 'X-CMC_PRO_API_KEY': CMC_API_KEY },
-                            params: { start: 1, limit: 100, convert: 'USD' }
+                            params: { start: 1, limit: 100, sort: 'percent_change_24h', sort_dir: 'desc', convert: 'USD' }
                         });
                         const cmcCoins = cmcResponse.data.data;
                         const topSymbols = cmcCoins.map(coin => `${coin.symbol}/EUR`);
-                        // Mette in cima i top di CoinMarketCap che esistono su Kraken, e in coda gli altri presenti su Kraken
+                        
                         const validCmcAssets = topSymbols.filter(sym => exchange.markets[sym] && exchange.markets[sym].active);
                         const remainingPairs = allKrakenPairs.filter(sym => !validCmcAssets.includes(sym));
                         dynamicAssets = [...validCmcAssets, ...remainingPairs];
@@ -164,7 +162,6 @@ async function runBotLoop() {
                         const baseCurrency = symbol.split('/')[0];
                         const assetBalance = balance.free[baseCurrency] || 0;
                         
-                        // Se possiedi una quantità di questo asset sul conto, il bot lo sorveglia per applicare TP e SL
                         if (assetBalance > 0.0001) {
                             const ticker = await exchange.fetchTicker(symbol);
                             const currentPrice = ticker.last;
@@ -202,7 +199,7 @@ async function runBotLoop() {
                     }
                 }
 
-                // 5. ANALISI ROTAZIONALE SU TUTTO IL MERCATO (Senza restrizioni a liste fisse)
+                // 5. ANALISI ROTAZIONALE DATO IL MOMENTUM DEI TOP GAINER + SUPPORTO
                 for (const symbol of dynamicAssets) {
                     try {
                         if (!exchange.markets[symbol]) continue;
@@ -232,23 +229,25 @@ async function runBotLoop() {
                         let targetInvestmentSize = isBtcBullish ? 12 : 5; 
                         if (eurBalance < targetInvestmentSize) targetInvestmentSize = eurBalance;
 
-                        // CRITERI DI INGRESSO FLESSIBILI (Cerca opportunità ovunque sul mercato)
-                        const nearSupport = support > 0 && (currentPrice <= support * 1.02);
-                        const isOversold = (rsi5m < 32 || rsi15m < 38);
-                        const strongMomentum = (rsi5m > 60 && currentPrice >= resistance * 0.98);
+                        // CRITERI DINAMICI: Dà priorità ai titoli con slancio positivo (Top Gainer di giornata) che testano supporti o mostrano forza
+                        const nearSupport = support > 0 && (currentPrice <= support * 1.025);
+                        const isOversold = (rsi5m < 35 || rsi15m < 40);
+                        const strongMomentum = (rsi5m > 58 && rsi15m > 52 && currentPrice >= resistance * 0.98);
 
                         let buyCondition = false;
                         let reason = "";
 
                         if (!isBtcBullish) {
-                            if (nearSupport || isOversold || score >= 2) {
+                            // In Bearish: seleziona solo chi mostra forza relativa o rimbalzi sicuri dai supporti con micro-lotti
+                            if (nearSupport || isOversold) {
                                 buyCondition = (eurBalance >= 5);
-                                reason = nearSupport ? "Test Supporto (Agile Bearish)" : "Ipervenduto / Rimbalzo";
+                                reason = "Rimbalzo su Top Asset (Agile Bearish)";
                             }
                         } else {
-                            if (strongMomentum || nearSupport || isOversold) {
+                            // In Bullish: sfrutta sia i breakout di forza che i pullback sui migliori titoli in movimento
+                            if (strongMomentum || nearSupport) {
                                 buyCondition = (eurBalance >= 5);
-                                reason = strongMomentum ? "Slancio / Forza (Bullish)" : "Supporto / Sconto (Bullish)";
+                                reason = strongMomentum ? "Slancio su Top Gainer (Bullish)" : "Pullback su Supporto (Bullish)";
                             }
                         }
 
@@ -256,19 +255,19 @@ async function runBotLoop() {
                             const estimatedFeePercent = 0.005; 
                             const netTargetPrice = currentPrice * (1 + estimatedFeePercent + (dynamicTakeProfit / 100));
 
-                            console.log(`[Scansione Totale] Trovata occasione su ${symbol} | Motivo: ${reason} | RSI(5m): ${rsi5m.toFixed(1)} | Supporto: €${support.toFixed(2)} | Prezzo: €${currentPrice}`);
+                            console.log(`[Top Momentum] Trovata occasione su ${symbol} | Motivo: ${reason} | RSI(5m): ${rsi5m.toFixed(1)} | Prezzo: €${currentPrice}`);
 
                             const amountToBuy = targetInvestmentSize / currentPrice;
                             const order = await exchange.createMarketBuyOrder(symbol, amountToBuy);
                             
-                            console.log(`[SUCCESSO ACQUISTO] Acquistati ~€${targetInvestmentSize} di ${symbol} a €${currentPrice} (${reason})! ID:`, order.id);
+                            console.log(`[SUCCESSO ACQUISTO TOP] Acquistati ~€${targetInvestmentSize} di ${symbol} a €${currentPrice} (${reason})! ID:`, order.id);
                             lastLog = `[${now}] Acquistati €${targetInvestmentSize} di ${symbol} (${reason})`;
                             
                             await new Promise(resolve => setTimeout(resolve, 60000));
                             break;
                         }
                     } catch (altErr) {
-                        // Passa all'asset successivo in caso di errore o coppia illiquida
+                        // Passa all'asset successivo in caso di errore
                     }
                 }
             }
