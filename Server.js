@@ -17,7 +17,7 @@ const exchange = new ccxt.kraken({
 });
 
 let botRunning = true;
-let lastLog = "Bot avviato con gestione avanzata giornate negative (Filtro anti-crollo, conferme di rimbalzo su supporto, micro-lotti a basso rischio, Fee Kraken).";
+let lastLog = "Bot avviato: Scansione e monitoraggio totale e dinamico su tutte le coppie crypto (Senza limiti fissi, gestione automatica di qualsiasi asset aperto).";
 
 // Dashboard di stato su Render
 app.get('/', (req, res) => {
@@ -27,7 +27,7 @@ app.get('/', (req, res) => {
             <body style="font-family: Arial; padding: 20px; background: #111; color: #fff;">
                 <h1>Cryptobot39 - Stato: ${botRunning ? 'ATTIVO & OPERATIVO' : 'FERMO'}</h1>
                 <p><b>Ultima attività:</b> ${lastLog}</p>
-                <p><b>Strategia Sicura Anti-Crollo:</b> Ingresso su supporto solo con conferma di rimbalzo in giorni rossi, lotti ridotti a 5€, SL/TP dinamici su BTC.</p>
+                <p><b>Strategia Totale:</b> Scansione universale su tutto il mercato, monitoraggio automatico di qualsiasi asset in portafoglio (DOT, ATOM, ecc.) e operatività elastica.</p>
             </body>
         </html>
     `);
@@ -116,7 +116,7 @@ async function runBotLoop() {
                 const eurBalance = balance.free['EUR'] || 0;
                 console.log(`[${now}] Saldo disponibile EUR: €${eurBalance.toFixed(2)}`);
 
-                // 2. Termometro BTC & Analisi del Trend (TF 15m)
+                // 2. Termometro BTC (Indicatore di rischio, non bloccante)
                 let isBtcBullish = true;
                 try {
                     const btcOhlcv = await exchange.fetchOHLCV('BTC/EUR', '15m', undefined, 50);
@@ -125,26 +125,47 @@ async function runBotLoop() {
                     const btcPrice = btcCloses[btcCloses.length - 1];
                     const btcSma20 = calculateSMA(btcCloses, 20);
 
-                    isBtcBullish = (btcPrice >= btcSma20 && btcRsi >= 45);
+                    isBtcBullish = (btcPrice >= btcSma20);
 
-                    lastLog = `[${now}] BTC a €${btcPrice.toFixed(2)} (RSI: ${btcRsi.toFixed(1)}) | Trend: ${isBtcBullish ? 'POSITIVO (Bullish)' : 'NEGATIVO (Bearish - Sudditanza ai ribassi)'}`;
+                    lastLog = `[${now}] BTC a €${btcPrice.toFixed(2)} (RSI: ${btcRsi.toFixed(1)}) | Trend Macro: ${isBtcBullish ? 'BULLISH' : 'BEARISH (Operativo elastico)'}`;
                     console.log(lastLog);
                 } catch (btcErr) {
                     console.log(`[${now}] Errore termometro BTC:`, btcErr.message);
                 }
 
-                // Soglie SL e TP dinamiche basate rigorosamente sul trend di BTC
+                // Soglie SL e TP dinamiche in base al trend di BTC
                 const dynamicStopLoss = isBtcBullish ? -5.0 : -2.0;    
                 const dynamicTakeProfit = isBtcBullish ? 2.0 : 1.0;     
 
-                // 3. Monitoraggio posizioni aperte (TP & SL dinamici effettivi)
-                const activeAssets = ['ETH/EUR', 'SOL/EUR', 'XRP/EUR', 'ADA/EUR', 'AVAX/EUR', 'LINK/EUR'];
-                for (const symbol of activeAssets) {
+                // 3. COSTRUZIONE DINAMICA DEL PANIERE DI SCANSIONE E MONITORAGGIO
+                // Raccoglie TUTTE le coppie in EUR disponibili su Kraken
+                let allKrakenPairs = Object.keys(exchange.markets).filter(symbol => symbol.endsWith('/EUR') && exchange.markets[symbol].active);
+
+                // Se abbiamo la chiave di CoinMarketCap, filtriamo e ordiniamo in base ai top token mondiali
+                let dynamicAssets = allKrakenPairs;
+                if (CMC_API_KEY) {
+                    try {
+                        const cmcResponse = await axios.get('https://pro-api.coinmarketcap.com/v1/cryptocurrency/listings/latest', {
+                            headers: { 'X-CMC_PRO_API_KEY': CMC_API_KEY },
+                            params: { start: 1, limit: 100, convert: 'USD' }
+                        });
+                        const cmcCoins = cmcResponse.data.data;
+                        const topSymbols = cmcCoins.map(coin => `${coin.symbol}/EUR`);
+                        // Mette in cima i top di CoinMarketCap che esistono su Kraken, e in coda gli altri presenti su Kraken
+                        const validCmcAssets = topSymbols.filter(sym => exchange.markets[sym] && exchange.markets[sym].active);
+                        const remainingPairs = allKrakenPairs.filter(sym => !validCmcAssets.includes(sym));
+                        dynamicAssets = [...validCmcAssets, ...remainingPairs];
+                    } catch (cmcErr) {}
+                }
+
+                // 4. MONITORAGGIO AUTOMATICO DI TUTTI GLI ASSET ATTUALMENTE POSSEDUTI (Inclusi DOT, ATOM, ecc.)
+                for (const symbol of dynamicAssets) {
                     try {
                         const baseCurrency = symbol.split('/')[0];
                         const assetBalance = balance.free[baseCurrency] || 0;
                         
-                        if (assetBalance > 0.0001 && exchange.markets[symbol]) {
+                        // Se possiedi una quantità di questo asset sul conto, il bot lo sorveglia per applicare TP e SL
+                        if (assetBalance > 0.0001) {
                             const ticker = await exchange.fetchTicker(symbol);
                             const currentPrice = ticker.last;
 
@@ -158,19 +179,19 @@ async function runBotLoop() {
                             } catch (e) {}
 
                             const pnlPercent = ((currentPrice - entryPrice) / entryPrice) * 100;
-                            console.log(`[Posizione] ${symbol} | Ingresso: €${entryPrice.toFixed(2)} | Attuale: €${currentPrice.toFixed(2)} | P&L: ${pnlPercent.toFixed(2)}% [SL: ${dynamicStopLoss}%, TP: ${dynamicTakeProfit}%]`);
+                            console.log(`[Posizione Aperta] ${symbol} | Ingresso: €${entryPrice.toFixed(2)} | Attuale: €${currentPrice.toFixed(2)} | P&L: ${pnlPercent.toFixed(2)}% [SL: ${dynamicStopLoss}%, TP: ${dynamicTakeProfit}%]`);
 
                             if (pnlPercent >= dynamicTakeProfit) {
                                 console.log(`[TAKE-PROFIT] Target raggiunto su ${symbol} (+${pnlPercent.toFixed(2)}%). Vendita in corso...`);
                                 const sellOrder = await exchange.createMarketSellOrder(symbol, assetBalance);
-                                console.log(`[SUCCESSO VENDITA] TP eseguito! ID:`, sellOrder.id);
+                                console.log(`[SUCCESSO VENDITA] TP eseguito su ${symbol}! ID:`, sellOrder.id);
                                 lastLog = `[${now}] Take-Profit eseguito su ${symbol} (+${pnlPercent.toFixed(2)}%)`;
                                 await new Promise(resolve => setTimeout(resolve, 60000));
                                 break;
                             } else if (pnlPercent <= dynamicStopLoss) {
                                 console.log(`[STOP-LOSS] Soglia di protezione raggiunta su ${symbol} (${pnlPercent.toFixed(2)}%). Chiusura in corso...`);
                                 const sellOrder = await exchange.createMarketSellOrder(symbol, assetBalance);
-                                console.log(`[SUCCESSO STOP-LOSS] SL eseguito! ID:`, sellOrder.id);
+                                console.log(`[SUCCESSO STOP-LOSS] SL eseguito su ${symbol}! ID:`, sellOrder.id);
                                 lastLog = `[${now}] Stop-Loss eseguito su ${symbol} (${pnlPercent.toFixed(2)}%)`;
                                 await new Promise(resolve => setTimeout(resolve, 60000));
                                 break;
@@ -181,22 +202,7 @@ async function runBotLoop() {
                     }
                 }
 
-                // 4. SCANSIONE DINAMICA COMPLETA (CoinMarketCap + Kraken)
-                let dynamicAssets = ['ETH/EUR', 'SOL/EUR', 'XRP/EUR', 'ADA/EUR', 'AVAX/EUR', 'LINK/EUR', 'DOT/EUR', 'MATIC/EUR', 'UNI/EUR', 'ATOM/EUR'];
-                if (CMC_API_KEY) {
-                    try {
-                        const cmcResponse = await axios.get('https://pro-api.coinmarketcap.com/v1/cryptocurrency/listings/latest', {
-                            headers: { 'X-CMC_PRO_API_KEY': CMC_API_KEY },
-                            params: { start: 1, limit: 50, convert: 'USD' }
-                        });
-                        const cmcCoins = cmcResponse.data.data;
-                        const topSymbols = cmcCoins.map(coin => `${coin.symbol}/EUR`);
-                        const validCmcAssets = topSymbols.filter(sym => exchange.markets[sym]);
-                        dynamicAssets = Array.from(new Set([...validCmcAssets, ...dynamicAssets]));
-                    } catch (cmcErr) {}
-                }
-
-                // 5. ANALISI ROTAZIONALE ANTI-CROLLO
+                // 5. ANALISI ROTAZIONALE SU TUTTO IL MERCATO (Senza restrizioni a liste fisse)
                 for (const symbol of dynamicAssets) {
                     try {
                         if (!exchange.markets[symbol]) continue;
@@ -219,39 +225,30 @@ async function runBotLoop() {
                         const rsi15m = calculateRSI(closes15m);
                         const currentPrice = closes5m[closes5m.length - 1];
 
-                        // Verifica se l'ultima candela a 5m è VERDE (chiusura > apertura), segno di reazione/rimbalzo
-                        const lastOpen5m = ohlcv5m[ohlcv5m.length - 1][1];
-                        const isGreenBounce = currentPrice > lastOpen5m;
-
                         const { support, resistance } = findSupportAndResistance(ohlcv15m);
                         const { pattern, score } = detectChartPatterns(ohlcv15m);
 
-                        // Taglia dell'investimento: micro-lotti ultra-prudenti da 5€ in Bearish, 12€ in Bullish
+                        // Taglia dell'investimento: 5€ in Bearish, 12€ in Bullish
                         let targetInvestmentSize = isBtcBullish ? 12 : 5; 
                         if (eurBalance < targetInvestmentSize) targetInvestmentSize = eurBalance;
 
-                        // FILTRI DI INGRESSO INTELLIGENTI:
-                        const nearSupport = support > 0 && (currentPrice <= support * 1.015);
-                        const strongMomentum = (rsi5m > 62 && rsi15m > 58 && currentPrice >= resistance * 0.985);
+                        // CRITERI DI INGRESSO FLESSIBILI (Cerca opportunità ovunque sul mercato)
+                        const nearSupport = support > 0 && (currentPrice <= support * 1.02);
+                        const isOversold = (rsi5m < 32 || rsi15m < 38);
+                        const strongMomentum = (rsi5m > 60 && currentPrice >= resistance * 0.98);
 
                         let buyCondition = false;
                         let reason = "";
 
                         if (!isBtcBullish) {
-                            // GIORNATA NEGATIVA / BEARISH: 
-                            // Non comprare mai in caduta libera! Richiede che sia vicino al supporto E che ci sia la candela verde di rimbalzo (isGreenBounce)
-                            if (nearSupport && isGreenBounce) {
+                            if (nearSupport || isOversold || score >= 2) {
                                 buyCondition = (eurBalance >= 5);
-                                reason = "Rimbalzo Confermato su Supporto (Bearish Safe)";
+                                reason = nearSupport ? "Test Supporto (Agile Bearish)" : "Ipervenduto / Rimbalzo";
                             }
                         } else {
-                            // GIORNATA POSITIVA / BULLISH:
-                            if (strongMomentum) {
+                            if (strongMomentum || nearSupport || isOversold) {
                                 buyCondition = (eurBalance >= 5);
-                                reason = `Forza / Breakout su Resistenza (€${resistance.toFixed(2)})`;
-                            } else if (nearSupport) {
-                                buyCondition = (eurBalance >= 5);
-                                reason = "Rimbalzo da Supporto (Bullish)";
+                                reason = strongMomentum ? "Slancio / Forza (Bullish)" : "Supporto / Sconto (Bullish)";
                             }
                         }
 
@@ -259,19 +256,19 @@ async function runBotLoop() {
                             const estimatedFeePercent = 0.005; 
                             const netTargetPrice = currentPrice * (1 + estimatedFeePercent + (dynamicTakeProfit / 100));
 
-                            console.log(`[Scansione Protetta] Scelto ${symbol} | Motivo: ${reason} | RSI(5m): ${rsi5m.toFixed(1)} | Supporto: €${support.toFixed(2)} | Prezzo: €${currentPrice}`);
+                            console.log(`[Scansione Totale] Trovata occasione su ${symbol} | Motivo: ${reason} | RSI(5m): ${rsi5m.toFixed(1)} | Supporto: €${support.toFixed(2)} | Prezzo: €${currentPrice}`);
 
                             const amountToBuy = targetInvestmentSize / currentPrice;
                             const order = await exchange.createMarketBuyOrder(symbol, amountToBuy);
                             
-                            console.log(`[SUCCESSO ACQUISTO PROTETTO] Acquistati ~€${targetInvestmentSize} di ${symbol} a €${currentPrice} (${reason})! ID:`, order.id);
+                            console.log(`[SUCCESSO ACQUISTO] Acquistati ~€${targetInvestmentSize} di ${symbol} a €${currentPrice} (${reason})! ID:`, order.id);
                             lastLog = `[${now}] Acquistati €${targetInvestmentSize} di ${symbol} (${reason})`;
                             
                             await new Promise(resolve => setTimeout(resolve, 60000));
                             break;
                         }
                     } catch (altErr) {
-                        // Passa all'asset successivo in caso di errore
+                        // Passa all'asset successivo in caso di errore o coppia illiquida
                     }
                 }
             }
