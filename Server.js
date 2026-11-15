@@ -17,12 +17,10 @@ const exchange = new ccxt.kraken({
 });
 
 let botRunning = true;
-let lastLog = "Bot avviato: Watchlist Outperformer + Panic Switch Chirurgico + Scansione Universale EUR.";
+let lastLog = "Bot avviato: Monitoraggio portafoglio indipendente + Watchlist Outperformer + Analisi Multi-TF.";
 
-// Memoria temporanea per monitorare le Outperformer uscite durante il panico pronte al rientro
 let watchedOutperformers = [];
 
-// Dashboard di stato su Render
 app.get('/', (req, res) => {
     res.send(`
         <html>
@@ -30,20 +28,18 @@ app.get('/', (req, res) => {
             <body style="font-family: Arial; padding: 20px; background: #111; color: #fff;">
                 <h1>Cryptobot39 - Stato: ${botRunning ? 'ATTIVO & OPERATIVO' : 'FERMO'}</h1>
                 <p><b>Ultima attività:</b> ${lastLog}</p>
-                <p><b>Watchlist Outperformer:</b> ${watchedOutperformers.length > 0 ? watchedOutperformers.join(', ') : 'Nessuna in attesa di rientro'}</p>
+                <p><b>Watchlist Outperformer:</b> ${watchedOutperformers.length > 0 ? watchedOutperformers.join(', ') : 'Nessuna'}</p>
             </body>
         </html>
     `);
 });
 
-// Toggle ON/OFF
 app.post('/api/toggle', (req, res) => {
     botRunning = !botRunning;
     lastLog = `Bot ${botRunning ? 'riattivato' : 'messo in pausa'} via API.`;
     res.json({ success: true, botRunning, message: lastLog });
 });
 
-// Calcolo RSI sicuro
 function calculateRSI(closes, period = 14) {
     if (!closes || closes.length < period + 1) return 50;
     let gains = 0;
@@ -60,14 +56,12 @@ function calculateRSI(closes, period = 14) {
     return 100 - (100 / (1 + rs));
 }
 
-// Calcolo Media Mobile (SMA) sicuro
 function calculateSMA(closes, period) {
     if (!closes || closes.length < period) return closes ? closes[closes.length - 1] : 0;
     const slice = closes.slice(-period);
     return slice.reduce((a, b) => a + b, 0) / period;
 }
 
-// Rilevamento Supporti e Resistenze geometriche avanzate
 function findSupportAndResistance(ohlcv) {
     if (!ohlcv || ohlcv.length < 20) return { support: 0, resistance: 0 };
     const lows = ohlcv.map(c => c[3]); 
@@ -77,44 +71,33 @@ function findSupportAndResistance(ohlcv) {
     return { support, resistance };
 }
 
-// Analisi tecnica avanzata di pattern e conferma candela verde
 function detectChartPatterns(ohlcv) {
     if (!ohlcv || ohlcv.length < 15) return { pattern: "NONE", score: 0, isGreenCandle: false };
-    
     const lastCandle = ohlcv[ohlcv.length - 1];
-    const isGreenCandle = lastCandle[4] > lastCandle[1]; // Chiusura > Apertura
-    
+    const isGreenCandle = lastCandle[4] > lastCandle[1];
     const closes = ohlcv.map(c => c[4]);
-    const highs = ohlcv.map(c => c[2]);
     const lows = ohlcv.map(c => c[3]);
-    
     let pattern = "NORMAL_ACTION";
     let score = 0;
-
     const currentClose = closes[closes.length - 1];
     const recentMin = Math.min(...lows.slice(-10));
-    
     if (Math.abs(currentClose - recentMin) / recentMin < 0.01 && isGreenCandle) {
         pattern = "SUPPORT_BOUNCE_CONFIRMED";
         score += 3;
     }
-
     return { pattern, score, isGreenCandle };
 }
 
-// Controllo Sentiment Macro globale
 async function getMacroSentiment() {
     try {
         const fngRes = await axios.get('https://api.alternative.me/fng/?limit=1', { timeout: 4000 });
         const fngValue = parseInt(fngRes.data.data[0].value, 10);
-        const fngClassification = fngRes.data.data[0].value_classification;
-        return { value: fngValue, label: fngClassification, isExtremeFear: fngValue <= 20 };
+        return { value: fngValue, label: fngRes.data.data[0].value_classification, isExtremeFear: fngValue <= 20 };
     } catch (e) {
         return { value: 50, label: "Neutral", isExtremeFear: false };
     }
 }
 
-// Funzione principale del Bot (Gira 24/7 in background)
 async function runBotLoop() {
     while (true) {
         try {
@@ -122,15 +105,13 @@ async function runBotLoop() {
                 const now = new Date().toLocaleString();
                 await exchange.loadMarkets();
 
-                // 1. Lettura Saldi su Kraken (in EUR)
+                // 1. Lettura Saldi su Kraken
                 const balance = await exchange.fetchBalance();
                 const eurBalance = balance.free['EUR'] || 0;
                 console.log(`[${now}] Saldo disponibile EUR: €${eurBalance.toFixed(2)}`);
 
-                // 2. Sentiment Macro
+                // 2. Sentiment Macro & Termometro BTC
                 const macro = await getMacroSentiment();
-
-                // 3. Termometro BTC & Rilevamento Panic Crash
                 let isBtcBullish = true;
                 let isPanicCrash = false;
                 let btcChange1h = 0;
@@ -138,7 +119,6 @@ async function runBotLoop() {
                 try {
                     const btcOhlcv15m = await exchange.fetchOHLCV('BTC/EUR', '15m', undefined, 50);
                     const btcOhlcv1h = await exchange.fetchOHLCV('BTC/EUR', '1h', undefined, 5);
-                    
                     const btcCloses15m = btcOhlcv15m.map(c => c[4]);
                     const btcRsi15m = calculateRSI(btcCloses15m, 14);
                     const btcPrice = btcCloses15m[btcCloses15m.length - 1];
@@ -150,11 +130,7 @@ async function runBotLoop() {
                     isBtcBullish = (btcPrice >= btcSma20 && btcRsi15m >= 45);
                     isPanicCrash = (btcChange1h <= -4.0) || (btcChange1h <= -3.0 && macro.isExtremeFear);
 
-                    const statusLabel = isPanicCrash 
-                        ? `🚨 PANIC CRASH (${btcChange1h.toFixed(2)}% in 1h)` 
-                        : (isBtcBullish ? 'BULLISH' : 'BEARISH / CAUTELA');
-
-                    lastLog = `[${now}] BTC: €${btcPrice.toFixed(2)} (1h: ${btcChange1h.toFixed(2)}%) | Watchlist Outperformer: ${watchedOutperformers.length} asset | Stato: ${statusLabel}`;
+                    lastLog = `[${now}] BTC: €${btcPrice.toFixed(2)} (1h: ${btcChange1h.toFixed(2)}%) | Watchlist: ${watchedOutperformers.length} asset | Stato: ${isPanicCrash ? '🚨 PANIC' : (isBtcBullish ? 'BULLISH' : 'BEARISH')}`;
                     console.log(lastLog);
                 } catch (btcErr) {
                     console.log(`[${now}] Errore termometro BTC:`, btcErr.message);
@@ -163,7 +139,7 @@ async function runBotLoop() {
                 const dynamicStopLoss = isBtcBullish ? -5.0 : -2.0;    
                 const dynamicTakeProfit = isBtcBullish ? 2.0 : 1.0;     
 
-                // 4. SCANSIONE COINMARKETCAP & TOP GAINER (24h)
+                // 3. SCANSIONE COINMARKETCAP & TOP GAINER
                 let allKrakenPairs = Object.keys(exchange.markets).filter(symbol => symbol.endsWith('/EUR') && exchange.markets[symbol].active);
                 let dynamicAssets = allKrakenPairs;
                 let cmcPerformanceMap = {};
@@ -181,20 +157,22 @@ async function runBotLoop() {
                             topSymbols.push(sym);
                             cmcPerformanceMap[sym] = coin.quote?.USD?.percent_change_24h || 0;
                         }
-                        
                         const validCmcAssets = topSymbols.filter(sym => exchange.markets[sym] && exchange.markets[sym].active);
                         const remainingPairs = allKrakenPairs.filter(sym => !validCmcAssets.includes(sym));
                         dynamicAssets = [...validCmcAssets, ...remainingPairs];
-                    } catch (cmcErr) {}
+                    } catch (e) {}
                 }
 
-                // 5. MONITORAGGIO GLOBALE POSIZIONI APERTE + AGGIUNTA ALLA WATCHLIST SE OUTPERFORMER ESCE DURANTE PANIC
-                for (const symbol of dynamicAssets) {
-                    try {
-                        const baseCurrency = symbol.split('/')[0];
-                        const assetBalance = balance.free[baseCurrency] || 0;
-                        
-                        if (assetBalance > 0.0001) {
+                // 4. MONITORAGGIO INDIPENDENTE E GLOBALE DI TUTTI GLI ASSET IN PORTAFOGLIO (DOT, ATOM, ECC.)
+                const totalBalances = balance.total || {};
+                for (const currency of Object.keys(totalBalances)) {
+                    if (currency === 'EUR' || currency === 'ZEUR' || currency === 'KFEE') continue;
+                    const totalAmount = balance.total[currency] || 0;
+                    if (totalAmount > 0.0001) {
+                        const symbol = `${currency}/EUR`;
+                        if (!exchange.markets[symbol]) continue;
+
+                        try {
                             const ticker = await exchange.fetchTicker(symbol);
                             const currentPrice = ticker.last;
 
@@ -206,26 +184,26 @@ async function runBotLoop() {
                             } catch (e) {}
 
                             const pnlPercent = ((currentPrice - entryPrice) / entryPrice) * 100;
+                            console.log(`[Portafoglio Attivo] Trovato ${symbol} | Qty: ${totalAmount} | Ingresso: €${entryPrice.toFixed(2)} | Attuale: €${currentPrice.toFixed(2)} | P&L: ${pnlPercent.toFixed(2)}%`);
 
-                            // GESTIONE PANIC KILL SWITCH CHIRURGICA CON AGGIORNAMENTO WATCHLIST
+                            const freeAmount = balance.free[currency] || 0;
+                            if (freeAmount <= 0.0001) continue;
+
+                            // GESTIONE PANIC KILL SWITCH CHIRURGICA
                             if (isPanicCrash) {
                                 if (pnlPercent < 1.2) {
-                                    console.log(`[🚨 PANIC EXIT] Crollo BTC! Liquidazione su ${symbol} (${pnlPercent.toFixed(2)}%).`);
-                                    await exchange.createMarketSellOrder(symbol, assetBalance);
-                                    
-                                    // Se era un titolo forte (performance 24h positiva), lo metto in Watchlist per seguirlo nel rimbalzo!
+                                    console.log(`[🚨 PANIC EXIT] Crollo BTC! Liquidazione d'emergenza su ${symbol} (${pnlPercent.toFixed(2)}%)...`);
+                                    await exchange.createMarketSellOrder(symbol, freeAmount);
                                     if ((cmcPerformanceMap[symbol] || 0) > 2.0 && !watchedOutperformers.includes(symbol)) {
                                         watchedOutperformers.push(symbol);
-                                        console.log(`[⭐ WATCHLIST] ${symbol} aggiunto alla watchlist delle outperformer da monitorare per il rientro.`);
                                     }
-
                                     lastLog = `[${now}] PANIC EXIT su ${symbol}`;
-                                    await new Promise(resolve => setTimeout(resolve, 60000));
+                                    await new Promise(resolve => setTimeout(resolve, 30000));
                                     break;
                                 } else {
-                                    console.log(`[🛡️ VINCENTE PROTETTA] ${symbol} regge a +${pnlPercent.toFixed(2)}%.`);
+                                    console.log(`[🛡️ VINCENTE PROTETTA] ${symbol} regge il crollo a +${pnlPercent.toFixed(2)}% patronizzata.`);
                                     if (pnlPercent >= dynamicTakeProfit + 1.5) {
-                                        await exchange.createMarketSellOrder(symbol, assetBalance);
+                                        await exchange.createMarketSellOrder(symbol, freeAmount);
                                         break;
                                     }
                                     continue;
@@ -234,28 +212,26 @@ async function runBotLoop() {
 
                             // GESTIONE ORDINARIA TP / SL
                             if (pnlPercent >= dynamicTakeProfit) {
-                                console.log(`[TAKE-PROFIT] Target raggiunto su ${symbol} (+${pnlPercent.toFixed(2)}%).`);
-                                await exchange.createMarketSellOrder(symbol, assetBalance);
-                                // Se ha chiuso in profitto con ottima performance, lo annotiamo nella watchlist
+                                console.log(`[TAKE-PROFIT] Target raggiunto su ${symbol} (+${pnlPercent.toFixed(2)}%). Vendita...`);
+                                await exchange.createMarketSellOrder(symbol, freeAmount);
                                 if ((cmcPerformanceMap[symbol] || 0) > 3.0 && !watchedOutperformers.includes(symbol)) {
                                     watchedOutperformers.push(symbol);
                                 }
-                                await new Promise(resolve => setTimeout(resolve, 60000));
+                                await new Promise(resolve => setTimeout(resolve, 30000));
                                 break;
                             } else if (pnlPercent <= dynamicStopLoss) {
-                                console.log(`[STOP-LOSS] Soglia raggiunta su ${symbol} (${pnlPercent.toFixed(2)}%).`);
-                                await exchange.createMarketSellOrder(symbol, assetBalance);
-                                await new Promise(resolve => setTimeout(resolve, 60000));
+                                console.log(`[STOP-LOSS] Soglia raggiunta su ${symbol} (${pnlPercent.toFixed(2)}%). Chiusura...`);
+                                await exchange.createMarketSellOrder(symbol, freeAmount);
+                                await new Promise(resolve => setTimeout(resolve, 30000));
                                 break;
                             }
+                        } catch (errPort) {
+                            console.log(`Errore gestione portafoglio per ${symbol}:`, errPort.message);
                         }
-                    } catch (posErr) {
-                        console.log(`Errore monitoraggio ${symbol}:`, posErr.message);
                     }
                 }
 
-                // 6. SCANSIONE PRIORITARIA WATCHLIST OUTPERFORMER + SCANSIONE UNIVERSALE TOP GAINER
-                // Prima controlla se c'è un'occasione di rientro sulle outperformer monitorate
+                // 5. SCANSIONE ACQUISTI (Watchlist Outperformer + Universale EUR)
                 let prioritizedAssets = [...new Set([...watchedOutperformers, ...dynamicAssets])];
 
                 for (const symbol of prioritizedAssets) {
@@ -264,7 +240,6 @@ async function runBotLoop() {
                         
                         const baseCurrency = symbol.split('/')[0];
                         if (balance.free[baseCurrency] && balance.free[baseCurrency] > 0.0001) {
-                            // Se lo abbiamo già comprato, lo rimuoviamo dalla watchlist in attesa di rientro
                             watchedOutperformers = watchedOutperformers.filter(s => s !== symbol);
                             continue; 
                         }
@@ -276,23 +251,19 @@ async function runBotLoop() {
 
                         const ohlcv5m = await exchange.fetchOHLCV(symbol, '5m', undefined, 30);
                         const ohlcv15m = await exchange.fetchOHLCV(symbol, '15m', undefined, 30);
-                        const ohlcv1h = await exchange.fetchOHLCV(symbol, '1h', undefined, 30);
-
                         const closes5m = ohlcv5m.map(c => c[4]);
                         const closes15m = ohlcv15m.map(c => c[4]);
-                        const closes1h = ohlcv1h.map(c => c[4]);
 
                         const rsi5m = calculateRSI(closes5m, 14);
                         const rsi15m = calculateRSI(closes15m, 14);
                         const currentPrice = closes5m[closes5m.length - 1];
 
-                        const { support, resistance } = findSupportAndResistance(ohlcv15m);
-                        const { score, isGreenCandle } = detectChartPatterns(ohlcv5m);
+                        const { support } = findSupportAndResistance(ohlcv15m);
+                        const { isGreenCandle } = detectChartPatterns(ohlcv5m);
 
                         let targetInvestmentSize = (isBtcBullish && !macro.isExtremeFear && !isPanicCrash) ? 12 : 5; 
                         if (eurBalance < targetInvestmentSize) targetInvestmentSize = eurBalance;
 
-                        // Filtro obbligatorio candela verde di rimbalzo
                         if (!isGreenCandle) continue;
 
                         const isWatchedOutperformer = watchedOutperformers.includes(symbol);
@@ -303,29 +274,24 @@ async function runBotLoop() {
                         let buyCondition = false;
                         let reason = "";
 
-                        // Se il titolo è nella nostra Watchlist delle Outperformer, appena mostra reazione e candela verde rientriamo subito!
-                        if (isWatchedOutperformer && (isGreenCandle || nearSupport)) {
+                        if (isWatchedOutperformer) {
                             buyCondition = (eurBalance >= 5);
-                            reason = `Reingresso Prioritario su Outperformer Monitorata (${perf24h.toFixed(1)}% 24h)`;
-                            // Rimuove dalla watchlist una volta rientrato
+                            reason = `Reingresso Outperformer (${perf24h.toFixed(1)}% 24h)`;
                             watchedOutperformers = watchedOutperformers.filter(s => s !== symbol);
                         } else if (!isPanicCrash) {
                             if (strongMomentum || nearSupport || isOversold) {
                                 buyCondition = (eurBalance >= 5);
-                                reason = strongMomentum ? "Slancio Top Gainer (Multi-TF)" : "Supporto Tecnico Confermato";
+                                reason = strongMomentum ? "Slancio Top Gainer" : "Supporto Confermato";
                             }
                         }
 
                         if (buyCondition) {
-                            console.log(`[Acquisto Mirato] Trovata occasione su ${symbol} | Motivo: ${reason} | Prezzo: €${currentPrice}`);
-
+                            console.log(`[Acquisto] Trovata occasione su ${symbol} | Motivo: ${reason} | Prezzo: €${currentPrice}`);
                             const amountToBuy = targetInvestmentSize / currentPrice;
                             const order = await exchange.createMarketBuyOrder(symbol, amountToBuy);
-                            
-                            console.log(`[SUCCESSO ACQUISTO] Acquistati ~€${targetInvestmentSize} di ${symbol} (${reason})! ID:`, order.id);
-                            lastLog = `[${now}] Acquistati €${targetInvestmentSize} di ${symbol} (${reason})`;
-                            
-                            await new Promise(resolve => setTimeout(resolve, 60000));
+                            console.log(`[SUCCESSO ACQUISTO] Acquistati ~€${targetInvestmentSize} di ${symbol}! ID:`, order.id);
+                            lastLog = `[${now}] Acquistati €${targetInvestmentSize} di ${symbol}`;
+                            await new Promise(resolve => setTimeout(resolve, 30000));
                             break;
                         }
                     } catch (altErr) {}
