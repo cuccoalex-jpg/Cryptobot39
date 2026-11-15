@@ -17,7 +17,7 @@ const exchange = new ccxt.kraken({
 });
 
 let botRunning = true;
-let lastLog = "Bot avviato: Confluenza Alta per Rally (5m/15m) + Fast-Cut Immediato (-0.7%) + TP Ottimizzato.";
+let lastLog = "Bot avviato: Confluenza Totale (MACD+Bollinger+Stocastico+Fibonacci+SMA) + Fast-Cut (-0.7%) + TP Ottimizzato.";
 
 let watchedOutperformers = [];
 
@@ -40,7 +40,7 @@ app.post('/api/toggle', (req, res) => {
     res.json({ success: true, botRunning, message: lastLog });
 });
 
-// --- INDICATORI TECNICI AVANZATI ---
+// --- MOTORE INDICATORI TECNICI A 360° ---
 
 function calculateRSI(closes, period = 14) {
     if (!closes || closes.length < period + 1) return 50;
@@ -270,13 +270,16 @@ async function runBotLoop() {
                     } catch (e) {}
                 }
 
-                // 4. MONITORAGGIO PORTAFOGLIO CON FAST-CUT (-0.7%) PER POSIZIONI CHE NON PARTONO
+                // 4. MONITORAGGIO GLOBALE PORTAFOGLIO (Con fix pulizia ticker XXBT e Fast-Cut -0.7%)
                 const totalBalances = balance.total || {};
                 for (const currency of Object.keys(totalBalances)) {
                     if (currency === 'EUR' || currency === 'ZEUR' || currency === 'KFEE') continue;
                     const totalAmount = balance.total[currency] || 0;
                     if (totalAmount > 0.0001) {
-                        const symbol = `${currency}/EUR`;
+                        let cleanCurrency = currency.replace(/^X/, '').replace(/^Z/, '');
+                        if (cleanCurrency === 'XBT') cleanCurrency = 'BTC';
+                        const symbol = `${cleanCurrency}/EUR`;
+                        
                         if (!exchange.markets[symbol]) continue;
 
                         try {
@@ -284,14 +287,20 @@ async function runBotLoop() {
                             const currentPrice = ticker.last;
 
                             let entryPrice = currentPrice;
+                            let foundRealTrade = false;
                             try {
-                                const trades = await exchange.fetchMyTrades(symbol, undefined, 5);
+                                const trades = await exchange.fetchMyTrades(symbol, undefined, 10);
                                 const buyTrades = trades.filter(t => t.side === 'buy');
-                                if (buyTrades.length > 0) entryPrice = buyTrades[buyTrades.length - 1].price;
-                            } catch (e) {}
+                                if (buyTrades.length > 0) {
+                                    entryPrice = buyTrades[buyTrades.length - 1].price;
+                                    foundRealTrade = true;
+                                }
+                            } catch (e) {
+                                console.log(`[⚠️ Attviso Storico] Impossibile leggere i trade passati per ${symbol}:`, e.message);
+                            }
 
                             const pnlPercent = ((currentPrice - entryPrice) / entryPrice) * 100;
-                            console.log(`[Portafoglio] ${symbol} | Qty: ${totalAmount} | Ingresso: €${entryPrice.toFixed(2)} | Attuale: €${currentPrice.toFixed(2)} | P&L: ${pnlPercent.toFixed(2)}%`);
+                            console.log(`[Portafoglio] ${symbol} | Qty: ${totalAmount} | Ingresso: €${entryPrice.toFixed(2)} (${foundRealTrade ? 'Reale' : 'Stimato'}) | Attuale: €${currentPrice.toFixed(2)} | P&L: ${pnlPercent.toFixed(2)}%`);
 
                             const freeAmount = balance.free[currency] || 0;
                             if (freeAmount <= 0.0001) continue;
@@ -305,13 +314,6 @@ async function runBotLoop() {
                                     }
                                     await new Promise(resolve => setTimeout(resolve, 30000));
                                     break;
-                                } else {
-                                    console.log(`[🛡️ VINCENTE PROTETTA] ${symbol} regge a +${pnlPercent.toFixed(2)}%.`);
-                                    if (pnlPercent >= dynamicTakeProfit + 1.2) {
-                                        await exchange.createMarketSellOrder(symbol, freeAmount);
-                                        break;
-                                    }
-                                    continue;
                                 }
                             }
 
@@ -324,9 +326,9 @@ async function runBotLoop() {
                                 await new Promise(resolve => setTimeout(resolve, 30000));
                                 break;
                             } 
-                            // ⚡ FAST-CUT: Se il trade entra ma va subito in rosso (-0.7%), chiude subito senza aspettare
+                            // ⚡ FAST-CUT: Se il trade non parte e va in rosso (-0.7%), chiusura immediata
                             else if (pnlPercent <= -0.7) {
-                                console.log(`[⚡ FAST-CUT] Il trade non parte e va in rosso (${pnlPercent.toFixed(2)}%). Chiusura immediata salvacapitale...`);
+                                console.log(`[⚡ FAST-CUT] Il trade non parte e va in rosso (${pnlPercent.toFixed(2)}%). Chiusura immediata...`);
                                 await exchange.createMarketSellOrder(symbol, freeAmount);
                                 await new Promise(resolve => setTimeout(resolve, 30000));
                                 break;
@@ -343,7 +345,7 @@ async function runBotLoop() {
                     }
                 }
 
-                // 5. SCANSIONE ATTIVA: CONFLUENZA ALTA PER CATTURARE I RALLY SUI TIMEFRAME STRETTI (5m/15m)
+                // 5. SCANSIONE ATTIVA: CONFLUENZA ALTA (5m/15m) + DIAGNOSTICA
                 let prioritizedAssets = [...new Set([...watchedOutperformers, ...dynamicAssets])];
 
                 for (const symbol of prioritizedAssets) {
@@ -361,7 +363,6 @@ async function runBotLoop() {
                             continue;
                         }
 
-                        // Timeframe stretti (5m e 15m) per intercettare il rally immediato
                         const ohlcv5m = await exchange.fetchOHLCV(symbol, '5m', undefined, 50);
                         const ohlcv15m = await exchange.fetchOHLCV(symbol, '15m', undefined, 50);
                         const closes5m = ohlcv5m.map(c => c[4]);
@@ -369,7 +370,7 @@ async function runBotLoop() {
 
                         const currentPrice = closes5m[closes5m.length - 1];
 
-                        // Indicatori tecnici completi
+                        // Indicatori tecnici
                         const rsi5m = calculateRSI(closes5m, 14);
                         const rsi15m = calculateRSI(closes15m, 14);
                         const sma20 = calculateSMA(closes15m, 20);
@@ -391,10 +392,9 @@ async function runBotLoop() {
                         let targetInvestmentSize = (isBtcBullish && !macro.isExtremeFear && !isPanicCrash) ? 12 : 5; 
                         if (eurBalance < targetInvestmentSize) targetInvestmentSize = eurBalance;
 
-                        // La candela verde sui 5m è obbligatoria per partire verso l'alto
                         if (!isGreenCandle) continue;
 
-                        // --- SISTEMA DI CONFLUENZA RIGOROSO PER RALLY (Score >= 4 su 5) ---
+                        // --- SISTEMA A PUNTEGGIO DI CONFLUENZA (Score >= 4 su 5) ---
                         let confluenceScore = 0;
                         let reasonsList = [];
 
@@ -402,7 +402,7 @@ async function runBotLoop() {
                         if (trendOk) { confluenceScore++; reasonsList.push("Trend SMA OK"); }
 
                         const macdOk = (macdData.histogram > 0 || macdData.macd > macdData.signal);
-                        if (macdOk) { confluenceScore++; reasonsList.push("MACD Rally OK"); }
+                        if (macdOk) { confluenceScore++; reasonsList.push("MACD OK"); }
 
                         const levelOk = (
                             currentPrice <= bollinger.lower * 1.02 ||
@@ -426,4 +426,38 @@ async function runBotLoop() {
 
                         if (isWatchedOutperformer) {
                             if (confluenceScore >= 3) {
-                                buyCondition
+                                buyCondition = (eurBalance >= 5);
+                                reason = `Reingresso Outperformer (Score: ${confluenceScore}/5 - ${reasonsList.join(', ')})`;
+                                watchedOutperformers = watchedOutperformers.filter(s => s !== symbol);
+                            }
+                        } else if (!isPanicCrash) {
+                            if (confluenceScore >= 4) {
+                                buyCondition = (eurBalance >= 5);
+                                reason = `Rally Confermato 5m/15m (Score: ${confluenceScore}/5 - ${reasonsList.join(', ')})`;
+                            }
+                        }
+
+                        if (buyCondition) {
+                            console.log(`[🚀 ACCENSIONE RALLY] Trovata occasione su ${symbol} | Motivo: ${reason} | Prezzo: €${currentPrice}`);
+                            const amountToBuy = targetInvestmentSize / currentPrice;
+                            const order = await exchange.createMarketBuyOrder(symbol, amountToBuy);
+                            console.log(`[SUCCESSO ACQUISTO] Acquistati ~€${targetInvestmentSize} di ${symbol}! ID:`, order.id);
+                            lastLog = `[${now}] Acquistati €${targetInvestmentSize} di ${symbol} (${reason})`;
+                            await new Promise(resolve => setTimeout(resolve, 30000));
+                            break;
+                        }
+                    } catch (altErr) {}
+                }
+            }
+        } catch (err) {
+            console.log("Errore nel ciclo principale:", err.message);
+        }
+
+        await new Promise(resolve => setTimeout(resolve, 180000));
+    }
+}
+
+app.listen(PORT, () => {
+    console.log(`Server in ascolto sulla porta ${PORT}`);
+    runBotLoop();
+});
