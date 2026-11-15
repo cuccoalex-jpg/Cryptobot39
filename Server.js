@@ -17,7 +17,7 @@ const exchange = new ccxt.kraken({
 });
 
 let botRunning = true;
-let lastLog = "Bot avviato: Sistema a Punteggio di Confluenza Tecnica + Diagnostica Attiva + TP Ottimizzato.";
+let lastLog = "Bot avviato: Confluenza Alta per Rally (5m/15m) + Fast-Cut Immediato (-0.7%) + TP Ottimizzato.";
 
 let watchedOutperformers = [];
 
@@ -40,7 +40,7 @@ app.post('/api/toggle', (req, res) => {
     res.json({ success: true, botRunning, message: lastLog });
 });
 
-// --- INDICATORI TECNICI ---
+// --- INDICATORI TECNICI AVANZATI ---
 
 function calculateRSI(closes, period = 14) {
     if (!closes || closes.length < period + 1) return 50;
@@ -270,7 +270,7 @@ async function runBotLoop() {
                     } catch (e) {}
                 }
 
-                // 4. Monitoraggio Globale Portafoglio
+                // 4. MONITORAGGIO PORTAFOGLIO CON FAST-CUT (-0.7%) PER POSIZIONI CHE NON PARTONO
                 const totalBalances = balance.total || {};
                 for (const currency of Object.keys(totalBalances)) {
                     if (currency === 'EUR' || currency === 'ZEUR' || currency === 'KFEE') continue;
@@ -323,19 +323,27 @@ async function runBotLoop() {
                                 }
                                 await new Promise(resolve => setTimeout(resolve, 30000));
                                 break;
-                            } else if (pnlPercent <= dynamicStopLoss) {
+                            } 
+                            // ⚡ FAST-CUT: Se il trade entra ma va subito in rosso (-0.7%), chiude subito senza aspettare
+                            else if (pnlPercent <= -0.7) {
+                                console.log(`[⚡ FAST-CUT] Il trade non parte e va in rosso (${pnlPercent.toFixed(2)}%). Chiusura immediata salvacapitale...`);
+                                await exchange.createMarketSellOrder(symbol, freeAmount);
+                                await new Promise(resolve => setTimeout(resolve, 30000));
+                                break;
+                            }
+                            else if (pnlPercent <= dynamicStopLoss) {
                                 console.log(`[STOP-LOSS] Soglia raggiunta su ${symbol} (${pnlPercent.toFixed(2)}%). Chiusura...`);
                                 await exchange.createMarketSellOrder(symbol, freeAmount);
                                 await new Promise(resolve => setTimeout(resolve, 30000));
                                 break;
                             }
                         } catch (errPort) {
-                            console.log(`Error portafoglio ${symbol}:`, errPort.message);
+                            console.log(`Errore portafoglio ${symbol}:`, errPort.message);
                         }
                     }
                 }
 
-                // 5. SCANSIONE ATTIVA CON SISTEMA A PUNTEGGIO DI CONFLUENZA E DIAGNOSTICA NEI LOG
+                // 5. SCANSIONE ATTIVA: CONFLUENZA ALTA PER CATTURARE I RALLY SUI TIMEFRAME STRETTI (5m/15m)
                 let prioritizedAssets = [...new Set([...watchedOutperformers, ...dynamicAssets])];
 
                 for (const symbol of prioritizedAssets) {
@@ -353,6 +361,7 @@ async function runBotLoop() {
                             continue;
                         }
 
+                        // Timeframe stretti (5m e 15m) per intercettare il rally immediato
                         const ohlcv5m = await exchange.fetchOHLCV(symbol, '5m', undefined, 50);
                         const ohlcv15m = await exchange.fetchOHLCV(symbol, '15m', undefined, 50);
                         const closes5m = ohlcv5m.map(c => c[4]);
@@ -360,7 +369,7 @@ async function runBotLoop() {
 
                         const currentPrice = closes5m[closes5m.length - 1];
 
-                        // Estrazione indicatori
+                        // Indicatori tecnici completi
                         const rsi5m = calculateRSI(closes5m, 14);
                         const rsi15m = calculateRSI(closes15m, 14);
                         const sma20 = calculateSMA(closes15m, 20);
@@ -376,42 +385,39 @@ async function runBotLoop() {
                         // Backtest storico
                         const backtest = await backtestPriceLevel(ohlcv15m, currentPrice, dynamicTakeProfit, Math.abs(dynamicStopLoss));
                         if (backtest.status === "PENALIZED") {
-                            console.log(`[Diagnostica] ${symbol} saltato: backtest storico sfavorevole.`);
                             continue;
                         }
 
                         let targetInvestmentSize = (isBtcBullish && !macro.isExtremeFear && !isPanicCrash) ? 12 : 5; 
                         if (eurBalance < targetInvestmentSize) targetInvestmentSize = eurBalance;
 
-                        if (!isGreenCandle) {
-                            console.log(`[Diagnostica] ${symbol} saltato: nessuna candela verde confermata a 5m.`);
-                            continue;
-                        }
+                        // La candela verde sui 5m è obbligatoria per partire verso l'alto
+                        if (!isGreenCandle) continue;
 
-                        // --- SISTEMA A PUNTEGGIO DI CONFLUENZA (Confluence Score) ---
+                        // --- SISTEMA DI CONFLUENZA RIGOROSO PER RALLY (Score >= 4 su 5) ---
                         let confluenceScore = 0;
                         let reasonsList = [];
 
                         const trendOk = (currentPrice >= sma20 || currentPrice >= sma50);
-                        if (trendOk) { confluenceScore++; reasonsList.push("SMA OK"); }
+                        if (trendOk) { confluenceScore++; reasonsList.push("Trend SMA OK"); }
 
-                        const macdOk = (macdData.histogram >= 0 || macdData.macd > macdData.signal);
-                        if (macdOk) { confluenceScore++; reasonsList.push("MACD OK"); }
+                        const macdOk = (macdData.histogram > 0 || macdData.macd > macdData.signal);
+                        if (macdOk) { confluenceScore++; reasonsList.push("MACD Rally OK"); }
 
                         const levelOk = (
-                            currentPrice <= bollinger.lower * 1.015 ||
+                            currentPrice <= bollinger.lower * 1.02 ||
                             (support > 0 && currentPrice <= support * 1.02) ||
-                            Math.abs(currentPrice - fib.fib618) / fib.fib618 < 0.02 ||
-                            Math.abs(currentPrice - fib.fib500) / fib.fib500 < 0.02 ||
-                            Math.abs(currentPrice - fib.fib382) / fib.fib382 < 0.02
+                            Math.abs(currentPrice - fib.fib618) / fib.fib618 < 0.025 ||
+                            Math.abs(currentPrice - fib.fib500) / fib.fib500 < 0.025 ||
+                            Math.abs(currentPrice - fib.fib382) / fib.fib382 < 0.025
                         );
                         if (levelOk) { confluenceScore++; reasonsList.push("Supporto/Fib/Bollinger OK"); }
 
-                        const oscillatorsOk = (rsi5m >= 30 && rsi5m <= 72 && stochastic.k < 80);
-                        if (oscillatorsOk) { confluenceScore++; reasonsList.push("RSI/Stocastico OK"); }
+                        const oscillatorsOk = (rsi5m >= 35 && rsi5m <= 72 && stochastic.k < 80);
+                        if (oscillatorsOk) { confluenceScore++; reasonsList.push("RSI/Stocastico Sani"); }
 
-                        const momentumOk = (momentum >= 0);
-                        if (momentumOk) { confluenceScore++; reasonsList.push("Momentum OK"); }
+                        const momentumOk = (momentum > 0);
+                        if (momentumOk) { confluenceScore++; reasonsList.push("Momentum Positivo"); }
 
                         const isWatchedOutperformer = watchedOutperformers.includes(symbol);
                         
@@ -420,41 +426,4 @@ async function runBotLoop() {
 
                         if (isWatchedOutperformer) {
                             if (confluenceScore >= 3) {
-                                buyCondition = (eurBalance >= 5);
-                                reason = `Reingresso Outperformer (Score: ${confluenceScore}/5 - ${reasonsList.join(', ')})`;
-                                watchedOutperformers = watchedOutperformers.filter(s => s !== symbol);
-                            }
-                        } else if (!isPanicCrash) {
-                            // Richiede almeno 4 indicatori su 5 d'accordo in contemporanea (ottima confluenza senza blocco totale)
-                            if (confluenceScore >= 4) {
-                                buyCondition = (eurBalance >= 5);
-                                reason = `Confluenza Tecnica Alta (Score: ${confluenceScore}/5 - ${reasonsList.join(', ')})`;
-                            }
-                        }
-
-                        if (buyCondition) {
-                            console.log(`[ACQUISTO CONFLUENTE] Trovata occasione su ${symbol} | Motivo: ${reason} | Prezzo: €${currentPrice}`);
-                            const amountToBuy = targetInvestmentSize / currentPrice;
-                            const order = await exchange.createMarketBuyOrder(symbol, amountToBuy);
-                            console.log(`[SUCCESSO ACQUISTO] Acquistati ~€${targetInvestmentSize} di ${symbol}! ID:`, order.id);
-                            lastLog = `[${now}] Acquistati €${targetInvestmentSize} di ${symbol} (${reason})`;
-                            await new Promise(resolve => setTimeout(resolve, 30000));
-                            break;
-                        } else {
-                            console.log(`[Diagnostica] ${symbol} scartato: Score confluenza insufficiente (${confluenceScore}/5).`);
-                        }
-                    } catch (altErr) {}
-                }
-            }
-        } catch (err) {
-            console.log("Errore nel ciclo principale:", err.message);
-        }
-
-        await new Promise(resolve => setTimeout(resolve, 180000));
-    }
-}
-
-app.listen(PORT, () => {
-    console.log(`Server in ascolto sulla porta ${PORT}`);
-    runBotLoop();
-});
+                                buyCondition
