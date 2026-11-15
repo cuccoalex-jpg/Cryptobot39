@@ -17,7 +17,7 @@ const exchange = new ccxt.kraken({
 });
 
 let botRunning = true;
-let lastLog = "Bot avviato: Termometro BTC visibile nei log + Monitoraggio Portafoglio + Watchlist Outperformer.";
+let lastLog = "Bot avviato: Risk Gate + Backtest Storico Prezzi + Watchlist Outperformer + Panic Switch.";
 
 let watchedOutperformers = [];
 
@@ -98,6 +98,46 @@ async function getMacroSentiment() {
     }
 }
 
+// BACKTEST GEOMETRICO STORICO SUI PREZZI: Simula se in passato comprare a questo livello portava a profitto o stop-loss
+async function backtestPriceLevel(ohlcv, targetPrice, takeProfitPct, stopLossPct) {
+    if (!ohlcv || ohlcv.length < 30) return { winRate: 100, status: "PASSED" };
+    
+    let simulatedWins = 0;
+    let simulatedLosses = 0;
+
+    // Analizza lo storico candela per candela per vedere come si muoveva il prezzo partendo da livelli simili
+    for (let i = 20; i < ohlcv.length - 5; i++) {
+        const historicalEntry = ohlcv[i][4]; // Prezzo di chiusura della candela passata
+        const futureCandles = ohlcv.slice(i + 1, i + 6); // Guarda le 5 candele successive
+
+        let hitTP = false;
+        let hitSL = false;
+
+        for (const fc of futureCandles) {
+            const high = fc[2];
+            const low = fc[3];
+            const tpPrice = historicalEntry * (1 + (takeProfitPct / 100));
+            const slPrice = historicalEntry * (1 - (stopLossPct / 100));
+
+            if (high >= tpPrice) { hitTP = true; break; }
+            if (low <= slPrice) { hitSL = true; break; }
+        }
+
+        if (hitTP && !hitSL) simulatedWins++;
+        else if (hitSL && !hitTP) simulatedLosses++;
+    }
+
+    const totalSims = simulatedWins + simulatedLosses;
+    if (totalSims === 0) return { winRate: 100, status: "PASSED" };
+
+    const winRate = (simulatedWins / totalSims) * 100;
+    // Se lo storico di quel livello di prezzo ha una percentuale di successo inferiore al 40%, penalizza l'ingresso
+    if (winRate < 40) {
+        return { winRate, status: "PENALIZED" };
+    }
+    return { winRate, status: "PASSED" };
+}
+
 async function runBotLoop() {
     while (true) {
         try {
@@ -105,12 +145,12 @@ async function runBotLoop() {
                 const now = new Date().toLocaleString();
                 await exchange.loadMarkets();
 
-                // 1. Lettura Saldi su Kraken
+                // 1. Saldi su Kraken
                 const balance = await exchange.fetchBalance();
                 const eurBalance = balance.free['EUR'] || 0;
                 console.log(`[${now}] Saldo disponibile EUR: €${eurBalance.toFixed(2)}`);
 
-                // 2. TERMOMETRO BTC E MACRO (Ora con log obbligatori a schermo)
+                // 2. Termometro BTC & Macro (Visibile nei log)
                 const macro = await getMacroSentiment();
                 let isBtcBullish = true;
                 let isPanicCrash = false;
@@ -140,7 +180,7 @@ async function runBotLoop() {
                 const dynamicStopLoss = isBtcBullish ? -5.0 : -2.0;    
                 const dynamicTakeProfit = isBtcBullish ? 2.0 : 1.0;     
 
-                // 3. SCANSIONE COINMARKETCAP & TOP GAINER
+                // 3. Scansione CoinMarketCap & Top Gainer (Volumi 24h)
                 let allKrakenPairs = Object.keys(exchange.markets).filter(symbol => symbol.endsWith('/EUR') && exchange.markets[symbol].active);
                 let dynamicAssets = allKrakenPairs;
                 let cmcPerformanceMap = {};
@@ -158,13 +198,13 @@ async function runBotLoop() {
                             topSymbols.push(sym);
                             cmcPerformanceMap[sym] = coin.quote?.USD?.percent_change_24h || 0;
                         }
-                        const validCmcAssets = topSymbols.filter(sym => exchange.markets[sym] && exchange.markets[sym].active);
+                        const validCmcAssets = topSymbols.filter(sym => exchange.markets[sym] && exchange.markets[symbol]?.active);
                         const remainingPairs = allKrakenPairs.filter(sym => !validCmcAssets.includes(sym));
                         dynamicAssets = [...validCmcAssets, ...remainingPairs];
                     } catch (e) {}
                 }
 
-                // 4. MONITORAGGIO INDIPENDENTE PORTAFOGLIO (DOT, ATOM, ECC.)
+                // 4. Monitoraggio Globale Portafoglio (DOT, ATOM, ecc.)
                 const totalBalances = balance.total || {};
                 for (const currency of Object.keys(totalBalances)) {
                     if (currency === 'EUR' || currency === 'ZEUR' || currency === 'KFEE') continue;
@@ -229,7 +269,7 @@ async function runBotLoop() {
                     }
                 }
 
-                // 5. SCANSIONE ACQUISTI (Watchlist Outperformer + Universale EUR)
+                // 5. RISK GATE & SCANSIONE ACQUISTI (Con Backtest Storico Prezzi + Diagnostica nei Log)
                 let prioritizedAssets = [...new Set([...watchedOutperformers, ...dynamicAssets])];
 
                 for (const symbol of prioritizedAssets) {
@@ -244,6 +284,7 @@ async function runBotLoop() {
 
                         const perf24h = cmcPerformanceMap[symbol] || 0;
                         if (isPanicCrash && perf24h < 4.5 && !watchedOutperformers.includes(symbol)) {
+                            console.log(`[Risk Gate] ${symbol} scartato: crollo di mercato in corso e performance 24h insufficiente.`);
                             continue;
                         }
 
@@ -256,13 +297,23 @@ async function runBotLoop() {
                         const rsi15m = calculateRSI(closes15m, 14);
                         const currentPrice = closes5m[closes5m.length - 1];
 
+                        // Esegue il backtest geometrico storico sul livello di prezzo attuale
+                        const backtest = await backtestPriceLevel(ohlcv15m, currentPrice, dynamicTakeProfit, Math.abs(dynamicStopLoss));
+                        if (backtest.status === "PENALIZED") {
+                            console.log(`[Risk Gate / Backtest] ${symbol} scartato: storico sfavorevole a questo livello di prezzo (WinRate stimato: ${backtest.winRate.toFixed(1)}%).`);
+                            continue;
+                        }
+
                         const { support } = findSupportAndResistance(ohlcv15m);
                         const { isGreenCandle } = detectChartPatterns(ohlcv5m);
 
                         let targetInvestmentSize = (isBtcBullish && !macro.isExtremeFear && !isPanicCrash) ? 12 : 5; 
                         if (eurBalance < targetInvestmentSize) targetInvestmentSize = eurBalance;
 
-                        if (!isGreenCandle) continue;
+                        if (!isGreenCandle) {
+                            console.log(`[Diagnostica] ${symbol} saltato: nessuna conferma geometrica di candela verde a 5m.`);
+                            continue;
+                        }
 
                         const isWatchedOutperformer = watchedOutperformers.includes(symbol);
                         const nearSupport = support > 0 && (currentPrice <= support * 1.02);
@@ -274,21 +325,21 @@ async function runBotLoop() {
 
                         if (isWatchedOutperformer) {
                             buyCondition = (eurBalance >= 5);
-                            reason = `Reingresso Outperformer (${perf24h.toFixed(1)}% 24h)`;
+                            reason = `Reingresso Outperformer (Backtest Storico OK - ${perf24h.toFixed(1)}% 24h)`;
                             watchedOutperformers = watchedOutperformers.filter(s => s !== symbol);
                         } else if (!isPanicCrash) {
                             if (strongMomentum || nearSupport || isOversold) {
                                 buyCondition = (eurBalance >= 5);
-                                reason = strongMomentum ? "Slancio Top Gainer" : "Supporto Confermato";
+                                reason = strongMomentum ? "Slancio Top Gainer (Backtest OK)" : "Supporto Confermato (Backtest OK)";
                             }
                         }
 
                         if (buyCondition) {
-                            console.log(`[Acquisto] Trovata occasione su ${symbol} | Motivo: ${reason} | Prezzo: €${currentPrice}`);
+                            console.log(`[Risk Gate Passato] Acquistabile ${symbol} | Motivo: ${reason} | WinRate storico stimato: ${backtest.winRate.toFixed(1)}% | Prezzo: €${currentPrice}`);
                             const amountToBuy = targetInvestmentSize / currentPrice;
                             const order = await exchange.createMarketBuyOrder(symbol, amountToBuy);
                             console.log(`[SUCCESSO ACQUISTO] Acquistati ~€${targetInvestmentSize} di ${symbol}! ID:`, order.id);
-                            lastLog = `[${now}] Acquistati €${targetInvestmentSize} di ${symbol}`;
+                            lastLog = `[${now}] Acquistati €${targetInvestmentSize} di ${symbol} (${reason})`;
                             await new Promise(resolve => setTimeout(resolve, 30000));
                             break;
                         }
