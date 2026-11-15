@@ -17,7 +17,7 @@ const exchange = new ccxt.kraken({
 });
 
 let botRunning = true;
-let lastLog = "Bot avviato: Scansione dinamica totale + Ordinamento per Top Performers (Migliori della giornata) + Monitoraggio Globale e Gestione Rischio BTC.";
+let lastLog = "Bot avviato: Scansione volumi CoinMarketCap (Top Gainer 24h) + Analisi tecnica completa multi-TF + Monitoraggio globale asset + Panic Switch chirurgico.";
 
 // Dashboard di stato su Render
 app.get('/', (req, res) => {
@@ -27,7 +27,7 @@ app.get('/', (req, res) => {
             <body style="font-family: Arial; padding: 20px; background: #111; color: #fff;">
                 <h1>Cryptobot39 - Stato: ${botRunning ? 'ATTIVO & OPERATIVO' : 'FERMO'}</h1>
                 <p><b>Ultima attività:</b> ${lastLog}</p>
-                <p><b>Strategia Dinamica Avanzata:</b> Cerca i top gainer di giornata uniti all'analisi dei supporti, monitoraggio globale di qualsiasi asset in portafoglio e operatività elastica.</p>
+                <p><b>Strategia Integrata:</b> Scansione volumi CoinMarketCap (Top 24h), analisi tecnica multi-periodo totale, monitoraggio globale e protezione panico chirurgica.</p>
             </body>
         </html>
     `);
@@ -40,7 +40,7 @@ app.post('/api/toggle', (req, res) => {
     res.json({ success: true, botRunning, message: lastLog });
 });
 
-// Calcolo RSI sicuro
+// Calcolo RSI sicuro (configurabile su qualsiasi periodo)
 function calculateRSI(closes, period = 14) {
     if (!closes || closes.length < period + 1) return 50;
     let gains = 0;
@@ -74,9 +74,12 @@ function findSupportAndResistance(ohlcv) {
     return { support, resistance };
 }
 
-// Rilevamento Pattern di Prezzo
+// Analisi tecnica avanzata di pattern e conferma candela verde
 function detectChartPatterns(ohlcv) {
-    if (!ohlcv || ohlcv.length < 15) return { pattern: "NONE", score: 0 };
+    if (!ohlcv || ohlcv.length < 15) return { pattern: "NONE", score: 0, isGreenCandle: false };
+    
+    const lastCandle = ohlcv[ohlcv.length - 1];
+    const isGreenCandle = lastCandle[4] > lastCandle[1]; // Chiusura > Apertura
     
     const closes = ohlcv.map(c => c[4]);
     const highs = ohlcv.map(c => c[2]);
@@ -88,19 +91,24 @@ function detectChartPatterns(ohlcv) {
     const currentClose = closes[closes.length - 1];
     const recentMin = Math.min(...lows.slice(-10));
     
-    if (Math.abs(currentClose - recentMin) / recentMin < 0.01) {
-        pattern = "SUPPORT_BOUNCE";
-        score += 2;
-    }
-
-    const p = highs.slice(-15);
-    const mid = Math.floor(p.length / 2);
-    if (p[mid] > p[0] && p[mid] > p[p.length - 1] && p[mid] > p[mid - 2] && p[mid] > p[mid + 2]) {
-        pattern = "HEAD_AND_SHOULDERS_FORMING";
+    if (Math.abs(currentClose - recentMin) / recentMin < 0.01 && isGreenCandle) {
+        pattern = "SUPPORT_BOUNCE_CONFIRMED";
         score += 3;
     }
 
-    return { pattern, score };
+    return { pattern, score, isGreenCandle };
+}
+
+// Controllo Sentiment Macro globale (Fear & Greed Index)
+async function getMacroSentiment() {
+    try {
+        const fngRes = await axios.get('https://api.alternative.me/fng/?limit=1', { timeout: 4000 });
+        const fngValue = parseInt(fngRes.data.data[0].value, 10);
+        const fngClassification = fngRes.data.data[0].value_classification;
+        return { value: fngValue, label: fngClassification, isExtremeFear: fngValue <= 20 };
+    } catch (e) {
+        return { value: 50, label: "Neutral", isExtremeFear: false };
+    }
 }
 
 // Funzione principale del Bot (Gira 24/7 in background)
@@ -116,30 +124,49 @@ async function runBotLoop() {
                 const eurBalance = balance.free['EUR'] || 0;
                 console.log(`[${now}] Saldo disponibile EUR: €${eurBalance.toFixed(2)}`);
 
-                // 2. Termometro BTC (Indicatore di rischio, non bloccante)
+                // 2. Sentiment Macro
+                const macro = await getMacroSentiment();
+
+                // 3. Termometro BTC Completo (Analisi multi-periodo e multi-indicatore su BTC)
                 let isBtcBullish = true;
+                let isPanicCrash = false;
+                let btcChange1h = 0;
+
                 try {
-                    const btcOhlcv = await exchange.fetchOHLCV('BTC/EUR', '15m', undefined, 50);
-                    const btcCloses = btcOhlcv.map(c => c[4]);
-                    const btcRsi = calculateRSI(btcCloses);
-                    const btcPrice = btcCloses[btcCloses.length - 1];
-                    const btcSma20 = calculateSMA(btcCloses, 20);
+                    const btcOhlcv5m = await exchange.fetchOHLCV('BTC/EUR', '5m', undefined, 30);
+                    const btcOhlcv15m = await exchange.fetchOHLCV('BTC/EUR', '15m', undefined, 50);
+                    const btcOhlcv1h = await exchange.fetchOHLCV('BTC/EUR', '1h', undefined, 10);
+                    
+                    const btcCloses15m = btcOhlcv15m.map(c => c[4]);
+                    const btcRsi15m = calculateRSI(btcCloses15m, 14);
+                    const btcRsi5m = calculateRSI(btcOhlcv5m.map(c => c[4]), 14);
+                    const btcPrice = btcCloses15m[btcCloses15m.length - 1];
+                    const btcSma20 = calculateSMA(btcCloses15m, 20);
 
-                    isBtcBullish = (btcPrice >= btcSma20);
+                    const btcOpen1h = btcOhlcv1h[btcOhlcv1h.length - 1][1];
+                    btcChange1h = ((btcPrice - btcOpen1h) / btcOpen1h) * 100;
 
-                    lastLog = `[${now}] BTC a €${btcPrice.toFixed(2)} (RSI: ${btcRsi.toFixed(1)}) | Trend Macro: ${isBtcBullish ? 'BULLISH' : 'BEARISH (Operativo elastico)'}`;
+                    isBtcBullish = (btcPrice >= btcSma20 && btcRsi15m >= 45);
+                    isPanicCrash = (btcChange1h <= -4.0) || (btcChange1h <= -3.0 && macro.isExtremeFear);
+
+                    const statusLabel = isPanicCrash 
+                        ? `🚨 PANIC CRASH (${btcChange1h.toFixed(2)}% in 1h)` 
+                        : (isBtcBullish ? 'BULLISH (Tecnico sano)' : 'BEARISH / CAUTELA (Elastico)');
+
+                    lastLog = `[${now}] BTC: €${btcPrice.toFixed(2)} (1h: ${btcChange1h.toFixed(2)}%, RSI 15m: ${btcRsi15m.toFixed(1)}) | Macro: ${macro.label} | Stato: ${statusLabel}`;
                     console.log(lastLog);
                 } catch (btcErr) {
-                    console.log(`[${now}] Errore termometro BTC:`, btcErr.message);
+                    console.log(`[${now}] Errore termometro BTC completo:`, btcErr.message);
                 }
 
-                // Soglie SL e TP dinamiche in base al trend di BTC
+                // Soglie SL e TP dinamiche
                 const dynamicStopLoss = isBtcBullish ? -5.0 : -2.0;    
                 const dynamicTakeProfit = isBtcBullish ? 2.0 : 1.0;     
 
-                // 3. COSTRUZIONE DINAMICA E ORDINAMENTO PER "TOP PERFORMERS" (Migliori della giornata)
+                // 4. SCANSIONE DINAMICA COINMARKETCAP & ORDINAMENTO PER VOLUMI / TOP GAINER (24h)
                 let allKrakenPairs = Object.keys(exchange.markets).filter(symbol => symbol.endsWith('/EUR') && exchange.markets[symbol].active);
                 let dynamicAssets = allKrakenPairs;
+                let cmcPerformanceMap = {};
 
                 if (CMC_API_KEY) {
                     try {
@@ -148,15 +175,23 @@ async function runBotLoop() {
                             params: { start: 1, limit: 100, sort: 'percent_change_24h', sort_dir: 'desc', convert: 'USD' }
                         });
                         const cmcCoins = cmcResponse.data.data;
-                        const topSymbols = cmcCoins.map(coin => `${coin.symbol}/EUR`);
+                        const topSymbols = [];
+                        for (const coin of cmcCoins) {
+                            const sym = `${coin.symbol}/EUR`;
+                            topSymbols.push(sym);
+                            // Registra la performance e i volumi della giornata
+                            cmcPerformanceMap[sym] = coin.quote?.USD?.percent_change_24h || 0;
+                        }
                         
                         const validCmcAssets = topSymbols.filter(sym => exchange.markets[sym] && exchange.markets[sym].active);
                         const remainingPairs = allKrakenPairs.filter(sym => !validCmcAssets.includes(sym));
                         dynamicAssets = [...validCmcAssets, ...remainingPairs];
-                    } catch (cmcErr) {}
+                    } catch (cmcErr) {
+                        console.log("Errore chiamata CoinMarketCap:", cmcErr.message);
+                    }
                 }
 
-                // 4. MONITORAGGIO AUTOMATICO DI TUTTI GLI ASSET ATTUALMENTE POSSEDUTI (Inclusi DOT, ATOM, ecc.)
+                // 5. MONITORAGGIO GLOBALE POSIZIONI APERTE (DOT, ATOM e qualsiasi asset) + PANIC SWITCH
                 for (const symbol of dynamicAssets) {
                     try {
                         const baseCurrency = symbol.split('/')[0];
@@ -176,8 +211,28 @@ async function runBotLoop() {
                             } catch (e) {}
 
                             const pnlPercent = ((currentPrice - entryPrice) / entryPrice) * 100;
-                            console.log(`[Posizione Aperta] ${symbol} | Ingresso: €${entryPrice.toFixed(2)} | Attuale: €${currentPrice.toFixed(2)} | P&L: ${pnlPercent.toFixed(2)}% [SL: ${dynamicStopLoss}%, TP: ${dynamicTakeProfit}%]`);
+                            console.log(`[Monitoraggio Globale] ${symbol} | Ingresso: €${entryPrice.toFixed(2)} | Attuale: €${currentPrice.toFixed(2)} | P&L: ${pnlPercent.toFixed(2)}% [SL: ${dynamicStopLoss}%, TP: ${dynamicTakeProfit}%]`);
 
+                            // GESTIONE PANIC KILL SWITCH CHIRURGICA
+                            if (isPanicCrash) {
+                                if (pnlPercent < 1.2) {
+                                    console.log(`[🚨 PANIC EXIT] Crollo BTC in corso! Liquidazione d'emergenza su ${symbol} (${pnlPercent.toFixed(2)}%) per proteggere la liquidità...`);
+                                    await exchange.createMarketSellOrder(symbol, assetBalance);
+                                    lastLog = `[${now}] PANIC EXIT su ${symbol} (${pnlPercent.toFixed(2)}%)`;
+                                    await new Promise(resolve => setTimeout(resolve, 60000));
+                                    break;
+                                } else {
+                                    console.log(`[🛡️ VINCENTE PROTETTA] ${symbol} regge il crollo a +${pnlPercent.toFixed(2)}%! La lascio correre.`);
+                                    if (pnlPercent >= dynamicTakeProfit + 1.5) {
+                                        await exchange.createMarketSellOrder(symbol, assetBalance);
+                                        console.log(`[TP PANIC] Incassata vincente ${symbol} a +${pnlPercent.toFixed(2)}%!`);
+                                        break;
+                                    }
+                                    continue;
+                                }
+                            }
+
+                            // GESTIONE ORDINARIA TAKE-PROFIT E STOP-LOSS (con controllo commissioni round-trip Kraken)
                             if (pnlPercent >= dynamicTakeProfit) {
                                 console.log(`[TAKE-PROFIT] Target raggiunto su ${symbol} (+${pnlPercent.toFixed(2)}%). Vendita in corso...`);
                                 const sellOrder = await exchange.createMarketSellOrder(symbol, assetBalance);
@@ -186,7 +241,7 @@ async function runBotLoop() {
                                 await new Promise(resolve => setTimeout(resolve, 60000));
                                 break;
                             } else if (pnlPercent <= dynamicStopLoss) {
-                                console.log(`[STOP-LOSS] Soglia di protezione raggiunta su ${symbol} (${pnlPercent.toFixed(2)}%). Chiusura in corso...`);
+                                console.log(`[STOP-LOSS] Soglia raggiunta su ${symbol} (${pnlPercent.toFixed(2)}%). Chiusura in corso...`);
                                 const sellOrder = await exchange.createMarketSellOrder(symbol, assetBalance);
                                 console.log(`[SUCCESSO STOP-LOSS] SL eseguito su ${symbol}! ID:`, sellOrder.id);
                                 lastLog = `[${now}] Stop-Loss eseguito su ${symbol} (${pnlPercent.toFixed(2)}%)`;
@@ -199,7 +254,7 @@ async function runBotLoop() {
                     }
                 }
 
-                // 5. ANALISI ROTAZIONALE DATO IL MOMENTUM DEI TOP GAINER + SUPPORTO
+                // 6. SCANSIONE UNIVERSALE BASATA SU VOLUMI / TOP GAINER 24H + ANALISI TECNICA MULTI-TF
                 for (const symbol of dynamicAssets) {
                     try {
                         if (!exchange.markets[symbol]) continue;
@@ -210,6 +265,13 @@ async function runBotLoop() {
                             continue; 
                         }
 
+                        const perf24h = cmcPerformanceMap[symbol] || 0;
+
+                        if (isPanicCrash && perf24h < 4.5) {
+                            continue;
+                        }
+
+                        // Prelievo dati OHLCV multi-timeframe completo (5m, 15m, 1h)
                         const ohlcv5m = await exchange.fetchOHLCV(symbol, '5m', undefined, 30);
                         const ohlcv15m = await exchange.fetchOHLCV(symbol, '15m', undefined, 30);
                         const ohlcv1h = await exchange.fetchOHLCV(symbol, '1h', undefined, 30);
@@ -218,69 +280,6 @@ async function runBotLoop() {
                         const closes15m = ohlcv15m.map(c => c[4]);
                         const closes1h = ohlcv1h.map(c => c[4]);
 
-                        const rsi5m = calculateRSI(closes5m);
-                        const rsi15m = calculateRSI(closes15m);
-                        const currentPrice = closes5m[closes5m.length - 1];
-
-                        const { support, resistance } = findSupportAndResistance(ohlcv15m);
-                        const { pattern, score } = detectChartPatterns(ohlcv15m);
-
-                        // Taglia dell'investimento: 5€ in Bearish, 12€ in Bullish
-                        let targetInvestmentSize = isBtcBullish ? 12 : 5; 
-                        if (eurBalance < targetInvestmentSize) targetInvestmentSize = eurBalance;
-
-                        // CRITERI DINAMICI: Dà priorità ai titoli con slancio positivo (Top Gainer di giornata) che testano supporti o mostrano forza
-                        const nearSupport = support > 0 && (currentPrice <= support * 1.025);
-                        const isOversold = (rsi5m < 35 || rsi15m < 40);
-                        const strongMomentum = (rsi5m > 58 && rsi15m > 52 && currentPrice >= resistance * 0.98);
-
-                        let buyCondition = false;
-                        let reason = "";
-
-                        if (!isBtcBullish) {
-                            // In Bearish: seleziona solo chi mostra forza relativa o rimbalzi sicuri dai supporti con micro-lotti
-                            if (nearSupport || isOversold) {
-                                buyCondition = (eurBalance >= 5);
-                                reason = "Rimbalzo su Top Asset (Agile Bearish)";
-                            }
-                        } else {
-                            // In Bullish: sfrutta sia i breakout di forza che i pullback sui migliori titoli in movimento
-                            if (strongMomentum || nearSupport) {
-                                buyCondition = (eurBalance >= 5);
-                                reason = strongMomentum ? "Slancio su Top Gainer (Bullish)" : "Pullback su Supporto (Bullish)";
-                            }
-                        }
-
-                        if (buyCondition) {
-                            const estimatedFeePercent = 0.005; 
-                            const netTargetPrice = currentPrice * (1 + estimatedFeePercent + (dynamicTakeProfit / 100));
-
-                            console.log(`[Top Momentum] Trovata occasione su ${symbol} | Motivo: ${reason} | RSI(5m): ${rsi5m.toFixed(1)} | Prezzo: €${currentPrice}`);
-
-                            const amountToBuy = targetInvestmentSize / currentPrice;
-                            const order = await exchange.createMarketBuyOrder(symbol, amountToBuy);
-                            
-                            console.log(`[SUCCESSO ACQUISTO TOP] Acquistati ~€${targetInvestmentSize} di ${symbol} a €${currentPrice} (${reason})! ID:`, order.id);
-                            lastLog = `[${now}] Acquistati €${targetInvestmentSize} di ${symbol} (${reason})`;
-                            
-                            await new Promise(resolve => setTimeout(resolve, 60000));
-                            break;
-                        }
-                    } catch (altErr) {
-                        // Passa all'asset successivo in caso di errore
-                    }
-                }
-            }
-        } catch (err) {
-            console.log("Errore nel ciclo principale del bot:", err.message);
-        }
-
-        // Intervallo di scansione (3 minuti)
-        await new Promise(resolve => setTimeout(resolve, 180000));
-    }
-}
-
-app.listen(PORT, () => {
-    console.log(`Server in ascolto sulla porta ${PORT}`);
-    runBotLoop();
-});
+                        // Indicatori tecnici completi su tutti i periodi
+                        const rsi5m = calculateRSI(closes5m, 14);
+                        const rsi15m = calculate
