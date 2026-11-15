@@ -17,7 +17,7 @@ const exchange = new ccxt.kraken({
 });
 
 let botRunning = true;
-let lastLog = "Bot avviato: Monitoraggio portafoglio indipendente + Watchlist Outperformer + Analisi Multi-TF.";
+let lastLog = "Bot avviato: Termometro BTC visibile nei log + Monitoraggio Portafoglio + Watchlist Outperformer.";
 
 let watchedOutperformers = [];
 
@@ -110,18 +110,19 @@ async function runBotLoop() {
                 const eurBalance = balance.free['EUR'] || 0;
                 console.log(`[${now}] Saldo disponibile EUR: €${eurBalance.toFixed(2)}`);
 
-                // 2. Sentiment Macro & Termometro BTC
+                // 2. TERMOMETRO BTC E MACRO (Ora con log obbligatori a schermo)
                 const macro = await getMacroSentiment();
                 let isBtcBullish = true;
                 let isPanicCrash = false;
                 let btcChange1h = 0;
+                let btcPrice = 0;
 
                 try {
                     const btcOhlcv15m = await exchange.fetchOHLCV('BTC/EUR', '15m', undefined, 50);
                     const btcOhlcv1h = await exchange.fetchOHLCV('BTC/EUR', '1h', undefined, 5);
                     const btcCloses15m = btcOhlcv15m.map(c => c[4]);
                     const btcRsi15m = calculateRSI(btcCloses15m, 14);
-                    const btcPrice = btcCloses15m[btcCloses15m.length - 1];
+                    btcPrice = btcCloses15m[btcCloses15m.length - 1];
                     const btcSma20 = calculateSMA(btcCloses15m, 20);
 
                     const btcOpen1h = btcOhlcv1h[btcOhlcv1h.length - 1][1];
@@ -130,10 +131,10 @@ async function runBotLoop() {
                     isBtcBullish = (btcPrice >= btcSma20 && btcRsi15m >= 45);
                     isPanicCrash = (btcChange1h <= -4.0) || (btcChange1h <= -3.0 && macro.isExtremeFear);
 
-                    lastLog = `[${now}] BTC: €${btcPrice.toFixed(2)} (1h: ${btcChange1h.toFixed(2)}%) | Watchlist: ${watchedOutperformers.length} asset | Stato: ${isPanicCrash ? '🚨 PANIC' : (isBtcBullish ? 'BULLISH' : 'BEARISH')}`;
+                    lastLog = `[${now}] 📊 Termometro BTC: €${btcPrice.toFixed(2)} | Variazione 1h: ${btcChange1h.toFixed(2)}% | RSI: ${btcRsi15m.toFixed(1)} | Stato: ${isPanicCrash ? '🚨 PANIC CRASH' : (isBtcBullish ? 'BULLISH' : 'BEARISH')}`;
                     console.log(lastLog);
                 } catch (btcErr) {
-                    console.log(`[${now}] Errore termometro BTC:`, btcErr.message);
+                    console.log(`[${now}] ⚠️ Errore lettura termometro BTC:`, btcErr.message);
                 }
 
                 const dynamicStopLoss = isBtcBullish ? -5.0 : -2.0;    
@@ -163,7 +164,7 @@ async function runBotLoop() {
                     } catch (e) {}
                 }
 
-                // 4. MONITORAGGIO INDIPENDENTE E GLOBALE DI TUTTI GLI ASSET IN PORTAFOGLIO (DOT, ATOM, ECC.)
+                // 4. MONITORAGGIO INDIPENDENTE PORTAFOGLIO (DOT, ATOM, ECC.)
                 const totalBalances = balance.total || {};
                 for (const currency of Object.keys(totalBalances)) {
                     if (currency === 'EUR' || currency === 'ZEUR' || currency === 'KFEE') continue;
@@ -184,24 +185,22 @@ async function runBotLoop() {
                             } catch (e) {}
 
                             const pnlPercent = ((currentPrice - entryPrice) / entryPrice) * 100;
-                            console.log(`[Portafoglio Attivo] Trovato ${symbol} | Qty: ${totalAmount} | Ingresso: €${entryPrice.toFixed(2)} | Attuale: €${currentPrice.toFixed(2)} | P&L: ${pnlPercent.toFixed(2)}%`);
+                            console.log(`[Portafoglio] ${symbol} | Qty: ${totalAmount} | Ingresso: €${entryPrice.toFixed(2)} | Attuale: €${currentPrice.toFixed(2)} | P&L: ${pnlPercent.toFixed(2)}%`);
 
                             const freeAmount = balance.free[currency] || 0;
                             if (freeAmount <= 0.0001) continue;
 
-                            // GESTIONE PANIC KILL SWITCH CHIRURGICA
                             if (isPanicCrash) {
                                 if (pnlPercent < 1.2) {
-                                    console.log(`[🚨 PANIC EXIT] Crollo BTC! Liquidazione d'emergenza su ${symbol} (${pnlPercent.toFixed(2)}%)...`);
+                                    console.log(`[🚨 PANIC EXIT] Crollo BTC! Liquidazione su ${symbol} (${pnlPercent.toFixed(2)}%)...`);
                                     await exchange.createMarketSellOrder(symbol, freeAmount);
                                     if ((cmcPerformanceMap[symbol] || 0) > 2.0 && !watchedOutperformers.includes(symbol)) {
                                         watchedOutperformers.push(symbol);
                                     }
-                                    lastLog = `[${now}] PANIC EXIT su ${symbol}`;
                                     await new Promise(resolve => setTimeout(resolve, 30000));
                                     break;
                                 } else {
-                                    console.log(`[🛡️ VINCENTE PROTETTA] ${symbol} regge il crollo a +${pnlPercent.toFixed(2)}% patronizzata.`);
+                                    console.log(`[🛡️ VINCENTE PROTETTA] ${symbol} regge a +${pnlPercent.toFixed(2)}%.`);
                                     if (pnlPercent >= dynamicTakeProfit + 1.5) {
                                         await exchange.createMarketSellOrder(symbol, freeAmount);
                                         break;
@@ -210,7 +209,6 @@ async function runBotLoop() {
                                 }
                             }
 
-                            // GESTIONE ORDINARIA TP / SL
                             if (pnlPercent >= dynamicTakeProfit) {
                                 console.log(`[TAKE-PROFIT] Target raggiunto su ${symbol} (+${pnlPercent.toFixed(2)}%). Vendita...`);
                                 await exchange.createMarketSellOrder(symbol, freeAmount);
@@ -226,7 +224,7 @@ async function runBotLoop() {
                                 break;
                             }
                         } catch (errPort) {
-                            console.log(`Errore gestione portafoglio per ${symbol}:`, errPort.message);
+                            console.log(`Errore portafoglio ${symbol}:`, errPort.message);
                         }
                     }
                 }
@@ -298,7 +296,7 @@ async function runBotLoop() {
                 }
             }
         } catch (err) {
-            console.log("Errore nel ciclo principale del bot:", err.message);
+            console.log("Errore nel ciclo principale:", err.message);
         }
 
         await new Promise(resolve => setTimeout(resolve, 180000));
