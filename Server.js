@@ -17,7 +17,7 @@ const exchange = new ccxt.kraken({
 });
 
 let botRunning = true;
-let lastLog = "Bot avviato: Shuffle Casuale + TP Rapido Laterale + Filtro Anti-Stablecoin EUR.";
+let lastLog = "Bot avviato: Rotazione Dinamica Momentum + Scansione Totale Kraken + TP Rapido.";
 
 let watchedOutperformers = [];
 
@@ -31,7 +31,7 @@ app.get('/', (req, res) => {
             <body style="font-family: Arial; padding: 20px; background: #111; color: #fff;">
                 <h1>Cryptobot39 - Stato: ${botRunning ? 'ATTIVO & OPERATIVO' : 'FERMO'}</h1>
                 <p><b>Ultima attività:</b> ${lastLog}</p>
-                <p><b>Watchlist CMC Top Movers:</b> ${watchedOutperformers.length > 0 ? watchedOutperformers.join(', ') : 'Sincronizzazione in corso...'}</p>
+                <p><b>Watchlist Dinamica / Kraken:</b> ${watchedOutperformers.length > 0 ? watchedOutperformers.join(', ') : 'Sincronizzazione in corso...'}</p>
             </body>
         </html>
     `);
@@ -257,13 +257,14 @@ async function runBotLoop() {
                     lastLog = `[${now}] 📊 Termometro BTC: €${btcPrice.toFixed(2)} | F&G: ${macro.value} | Stato: ${isPanicCrash ? '🚨 PANIC' : (isBtcBullish ? 'BULLISH' : 'BEARISH / LATERALE (TP Adattivo Rapido Attivo)')}`;
                     console.log(lastLog);
                 } catch (btcErr) {
-                    console.log(`[${now}] ⚠️ Errore lettura termometro BTC:`, btcErr.message);
+                    console.log(`[${now}] 🙏 Errore lettura termometro BTC:`, btcErr.message);
                     isBtcBullish = false;
                 }
 
                 const dynamicStopLoss = isBtcBullish ? -5.0 : -2.0;    
                 const dynamicTakeProfit = isBtcBullish ? 1.4 : 0.8;     
 
+                // 1. MONITORAGGIO PORTAFOGLIO E USCITE RAPIDE
                 const totalBalances = balance.total || {};
                 for (const currency of Object.keys(totalBalances)) {
                     if (stablecoinsToIgnore.includes(currency)) continue;
@@ -308,13 +309,13 @@ async function runBotLoop() {
                             }
 
                             if (netPnlPercent >= dynamicTakeProfit) {
-                                console.log(`[TAKE-PROFIT NETTO RAPIDO] Target raggiunto su ${symbol} (+${netPnlPercent.toFixed(2)}% effettivi). Vendita immediata in EUR...`);
+                                console.log(`[TAKE-PROFIT ROTAZIONE] Target raggiunto su ${symbol} (+${netPnlPercent.toFixed(2)}% effettivi). Vendita in EUR per ruotare su asset più forti...`);
                                 await exchange.createMarketSellOrder(symbol, freeAmount);
                                 await new Promise(resolve => setTimeout(resolve, 5000));
                                 continue;
                             } 
                             else if (netPnlPercent <= -0.7) {
-                                console.log(`[⚡ FAST-CUT] Il trade non parte e va in rosso (${netPnlPercent.toFixed(2)}% netto). Chiusura immediata in EUR...`);
+                                console.log(`[⚡ FAST-CUT] Il trade rallenta (${netPnlPercent.toFixed(2)}% netto). Uscita immediata in EUR...`);
                                 await exchange.createMarketSellOrder(symbol, freeAmount);
                                 await new Promise(resolve => setTimeout(resolve, 5000));
                                 continue;
@@ -331,6 +332,7 @@ async function runBotLoop() {
                     }
                 }
 
+                // 2. LISTA COMPLETA KRAKEN (Shuffle Casuale per coprire tutto)
                 let allKrakenPairs = Object.keys(exchange.markets).filter(symbol => {
                     if (!symbol.endsWith('/EUR') || !exchange.markets[symbol].active) return false;
                     const base = symbol.split('/')[0].replace(/^X/, '').replace(/^Z/, '');
@@ -339,22 +341,29 @@ async function runBotLoop() {
                 
                 allKrakenPairs = shuffleArray(allKrakenPairs);
 
+                // 3. CMC TOP VOLUMI & MOMENTUM (Fino a 300 asset)
                 let cmcTopMovers = [];
                 if (CMC_API_KEY) {
                     try {
                         const cmcResponse = await axios.get('https://pro-api.coinmarketcap.com/v1/cryptocurrency/listings/latest', {
                             headers: { 'X-CMC_PRO_API_KEY': CMC_API_KEY },
-                            params: { start: 1, limit: 100, sort: 'percent_change_24h', sort_dir: 'desc', convert: 'EUR' }
+                            params: { start: 1, limit: 300, sort: 'volume_24h', sort_dir: 'desc', convert: 'EUR' }
                         });
                         for (const coin of cmcResponse.data.data) {
                             const baseSym = coin.symbol;
                             if (stablecoinsToIgnore.includes(baseSym)) continue;
-                            const sym = `${baseSym}/EUR`;
+                            
+                            const volume24hEUR = coin.quote?.EUR?.volume_24h || 0;
                             const change24h = coin.quote?.EUR?.percent_change_24h || 0;
-                            if (exchange.markets[sym] && exchange.markets[sym].active && change24h > 0.8) {
-                                cmcTopMovers.push(sym);
-                                if (!watchedOutperformers.includes(sym)) {
-                                    watchedOutperformers.push(sym);
+                            
+                            // Selezioniamo asset con volumi reali (> 500k €) che mostrano forza (change24h > 0)
+                            if (volume24hEUR >= 500000 && change24h > 0) {
+                                const sym = `${baseSym}/EUR`;
+                                if (exchange.markets[sym] && exchange.markets[sym].active) {
+                                    cmcTopMovers.push(sym);
+                                    if (!watchedOutperformers.includes(sym)) {
+                                        watchedOutperformers.push(sym);
+                                    }
                                 }
                             }
                         }
@@ -363,7 +372,8 @@ async function runBotLoop() {
                     }
                 }
 
-                let prioritizedAssets = [...new Set([...watchedOutperformers, ...cmcTopMovers, ...allKrakenPairs.slice(0, 25)])];
+                // Unione per dare priorità ai top volumi attivi, esplorando comunque tutto il listino
+                let prioritizedAssets = [...new Set([...watchedOutperformers, ...cmcTopMovers, ...allKrakenPairs])];
 
                 for (const symbol of prioritizedAssets) {
                     try {
@@ -418,12 +428,12 @@ async function runBotLoop() {
 
                         if (!isPanicCrash && confluenceScore >= requiredScore) {
                             buyCondition = (eurBalance >= 5);
-                            reason = `Catturato Top Mover/Range (Score: ${confluenceScore}/5 - CMC Top: ${isTopMover ? 'Sì' : 'No'})`;
+                            reason = `Catturata Forza Relativa (Score: ${confluenceScore}/5 - Top Volume CMC: ${isTopMover ? 'Sì' : 'No'})`;
                             watchedOutperformers = watchedOutperformers.filter(s => s !== symbol);
                         }
 
                         if (buyCondition) {
-                            console.log(`[🚀 ACCENSIONE OPERATIVA] Trovata occasione su ${symbol} | Motivo: ${reason} | Prezzo: €${currentPrice}`);
+                            console.log(`[🚀 ACCENSIONE ROTAZIONE] Ingresso su ${symbol} | Motivo: ${reason} | Prezzo: €${currentPrice}`);
                             const amountToBuy = targetInvestmentSize / currentPrice;
                             const order = await exchange.createMarketBuyOrder(symbol, amountToBuy);
                             console.log(`[SUCCESSO ACQUISTO] Acquistati ~€${targetInvestmentSize} di ${symbol} in EUR! ID:`, order.id);
