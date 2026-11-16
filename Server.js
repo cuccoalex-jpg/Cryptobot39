@@ -17,7 +17,7 @@ const exchange = new ccxt.kraken({
 });
 
 let botRunning = true;
-let lastLog = "Bot avviato: Versione Definitiva Unificata (Tutte le funzioni attive).";
+let lastLog = "Bot avviato: Versione Definitiva Unificata (Lotti + Laterale + Live BTC + Fast-Cut -0.3% + TP Reale).";
 let watchedOutperformers = [];
 global.lastBtcLivePrice = 0;
 
@@ -67,6 +67,22 @@ function calculateRSI(closes, period = 14) {
     return 100 - (100 / (1 + rs));
 }
 
+function calculateBollingerBands(closes, period = 20, stdDevMultiplier = 2) {
+    if (!closes || closes.length < period) return { upper: 0, middle: 0, lower: 0, isSideways: false };
+    const slice = closes.slice(-period);
+    const middle = slice.reduce((a, b) => a + b, 0) / period;
+    const variance = slice.reduce((sum, val) => sum + Math.pow(val - middle, 2), 0) / period;
+    const stdDev = Math.sqrt(variance);
+    const upper = middle + (stdDevMultiplier * stdDev);
+    const lower = middle - (stdDevMultiplier * stdDev);
+    
+    // Rilevamento Mercato Laterale (Bande strette / compressione di volatilità)
+    const bandWidth = (upper - lower) / middle;
+    const isSideways = bandWidth < 0.04;
+
+    return { upper, middle, lower, isSideways };
+}
+
 function detectChartPatterns(ohlcv) {
     if (!ohlcv || ohlcv.length < 15) return { score: 0, isGreenCandle: false };
     const lastCandle = ohlcv[ohlcv.length - 1];
@@ -93,7 +109,7 @@ async function runBotLoop() {
                 const eurBalance = balance.free['EUR'] || balance.free['ZEUR'] || 0;
                 console.log(`[${now}] Saldo disponibile EUR: €${eurBalance.toFixed(2)}`);
 
-                // 1. CONTROLLO LIVE TICKER DI BTC (Protezione Flash Crash in tempo reale)
+                // 1. CONTROLLO LIVE TICKER DI BTC (Protezione Flash Crash in tempo reale)[span_0](start_span)[span_0](end_span)
                 let isLiveFlashCrash = false;
                 try {
                     const btcTicker = await exchange.fetchTicker('BTC/EUR');
@@ -121,11 +137,13 @@ async function runBotLoop() {
                 }
 
                 // SOGLIE OPERATIVE DEFINITIVE
-                const dynamicTakeProfit = 1.2;  // TP Lordo per utile netto reale
-                const fastCutThreshold = -0.3;  // Taglio immediato allo -0.3% reale per liberare la cassa
+                const dynamicTakeProfit = 1.2;  // TP Lordo per utile netto reale dopo le fee
+                const fastCutThreshold = -0.3;  // Taglio immediato allo -0.3% reale per liberare la cassa[span_1](start_span)[span_1](end_span)
 
-                // 3. MONITORAGGIO PORTAFOGLIO & GESTIONE USCITE / FAST-CUT
+                // 3. MONITORAGGIO PORTAFOGLIO, GESTIONE LOTTI & FAST-CUT
                 const totalBalances = balance.total || {};
+                let activePositionsCount = 0;
+
                 for (const currency of Object.keys(totalBalances)) {
                     if (stablecoinsToIgnore.includes(currency)) continue;
                     let cleanCurrency = currency.replace(/^X/, '').replace(/^Z/, '');
@@ -134,6 +152,7 @@ async function runBotLoop() {
 
                     const totalAmount = balance.total[currency] || 0;
                     if (totalAmount > 0.0001) {
+                        activePositionsCount++;
                         const symbol = `${cleanCurrency}/EUR`;
                         if (!exchange.markets[symbol]) continue;
 
@@ -152,15 +171,15 @@ async function runBotLoop() {
 
                             const grossPnlPercent = ((currentPrice - entryPrice) / entryPrice) * 100;
 
-                            console.log(`[Portafoglio] ${symbol} | Ingresso: €${entryPrice.toFixed(2)} | Attuale: €${currentPrice.toFixed(2)} | PnL Reale: ${grossPnlPercent.toFixed(2)}%`);
+                            console.log(`[Portafoglio / Lotto] ${symbol} | Ingresso: €${entryPrice.toFixed(2)} | Attuale: €${currentPrice.toFixed(2)} | PnL: ${grossPnlPercent.toFixed(2)}%`);
 
                             const freeAmount = balance.free[currency] || 0;
                             if (freeAmount <= 0.0001) continue;
 
-                            // USCITA AUTOMATICA (Flash Crash, TP raggiunto o Fast-Cut immediato)
+                            // USCITA AUTOMATICA (Flash Crash, TP raggiunto o Fast-Cut immediato sui lotti)[span_2](start_span)[span_2](end_span)
                             if (isLiveFlashCrash || grossPnlPercent >= dynamicTakeProfit || grossPnlPercent <= fastCutThreshold) {
-                                const reason = isLiveFlashCrash ? "Flash Crash Live" : (grossPnlPercent <= fastCutThreshold ? "⚡ Fast-Cut (-0.3%)" : "Take-Profit Raggiunto");
-                                console.log(`[🔄 ROTAZIONE] Vendita in corso su ${symbol} | Motivo: ${reason} (Variazione: ${grossPnlPercent.toFixed(2)}%)...`);
+                                const reason = isLiveFlashCrash ? "Flash Crash Live" : (grossPnlPercent <= fastCutThreshold ? "⚡ Fast-Cut (-0.3% Lotto)" : "Take-Profit Raggiunto");
+                                console.log(`[🔄 ROTAZIONE LOTTO] Chiusura su ${symbol} | Motivo: ${reason} (PnL: ${grossPnlPercent.toFixed(2)}%)...`);
                                 
                                 await exchange.createMarketSellOrder(symbol, freeAmount);
                                 await new Promise(resolve => setTimeout(resolve, 3000));
@@ -177,7 +196,7 @@ async function runBotLoop() {
                     continue;
                 }
 
-                // 4. SCANSIONE A 360° KRAKEN + CMC & IPERVENDUTI IN RIMBALZO (OVERSOLD BOUNCE)
+                // 4. SCANSIONE A 360° KRAKEN + CMC, MERCATO LATERALE & IPERVENDUTI IN RIMBALZO
                 let allKrakenPairs = Object.keys(exchange.markets).filter(symbol => {
                     if (!symbol.endsWith('/EUR') || !exchange.markets[symbol].active) return false;
                     const base = symbol.split('/')[0].replace(/^X/, '').replace(/^Z/, '');
@@ -214,8 +233,9 @@ async function runBotLoop() {
                     try {
                         if (!exchange.markets[symbol]) continue;
                         
+                        // GESTIONE LOTTI: Evitiamo di aprire un nuovo lotto sullo stesso asset se è già presente in portafoglio
                         const baseCurrency = symbol.split('/')[0];
-                        if (balance.free[baseCurrency] && balance.free[baseCurrency] > 0.0001) continue; 
+                        if (balance.total[baseCurrency] && balance.total[baseCurrency] > 0.0001) continue; 
 
                         const ohlcv5m = await exchange.fetchOHLCV(symbol, '5m', undefined, 30);
                         const closes5m = ohlcv5m.map(c => c[4]);
@@ -223,23 +243,25 @@ async function runBotLoop() {
                         
                         const rsi5m = calculateRSI(closes5m, 14);
                         const prevRsi5m = calculateRSI(closes5m.slice(0, -1), 14);
+                        const bollinger = calculateBollingerBands(closes5m);
                         const { isGreenCandle } = detectChartPatterns(ohlcv5m);
 
-                        // CACCIATORE DI IPERVENDUTI IN RIMBALZO + CANDELA VERDE
+                        // Condizioni di ingresso: Oversold Bounce oppure Mercato Laterale in compressione con candela verde[span_3](start_span)[span_3](end_span)
                         const isOversoldRebound = (prevRsi5m <= 35 && rsi5m > prevRsi5m && isGreenCandle);
+                        const isSidewaysBounce = (bollinger.isSideways && currentPrice <= bollinger.lower * 1.01 && isGreenCandle);
 
-                        if (!isGreenCandle && !isOversoldRebound) continue;
+                        if (!isGreenCandle && !isOversoldRebound && !isSidewaysBounce) continue;
 
                         let targetInvestmentSize = 5; 
                         if (eurBalance < targetInvestmentSize) targetInvestmentSize = eurBalance;
 
                         if (eurBalance >= 5) {
-                            const reason = isOversoldRebound ? "Oversold Bounce (Rimbalzo Ipervenduto 🚀)" : "Candela Verde Attiva";
-                            console.log(`[🚀 NUOVO INGRESSO] Acquisto su ${symbol} | Motivo: ${reason} | Prezzo: €${currentPrice}`);
+                            const reason = isOversoldRebound ? "Oversold Bounce (Rimbalzo Ipervenduto 🚀)" : (isSidewaysBounce ? "Mercato Laterale / Supporto Bollinger 📊" : "Candela Verde Attiva");
+                            console.log(`[🚀 NUOVO LOTTO] Apertura su ${symbol} | Motivo: ${reason} | Prezzo: €${currentPrice}`);
                             
                             const amountToBuy = targetInvestmentSize / currentPrice;
                             const order = await exchange.createMarketBuyOrder(symbol, amountToBuy);
-                            console.log(`[SUCCESSO] Acquistati €${targetInvestmentSize} di ${symbol}! ID:`, order.id);
+                            console.log(`[SUCCESSO] Acquistati €${targetInvestmentSize} di ${symbol} (Lotto n. ${activePositionsCount + 1})! ID:`, order.id);
                             lastLog = `[${now}] Acquistati €${targetInvestmentSize} di ${symbol} (${reason})`;
                             await new Promise(resolve => setTimeout(resolve, 15000));
                             break;
