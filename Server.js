@@ -17,7 +17,7 @@ const exchange = new ccxt.kraken({
 });
 
 let botRunning = true;
-let lastLog = "Bot avviato: Protezione Live BTC + Cacciatore Ipervenduti + Rotazione Rapida EUR.";
+let lastLog = "Bot avviato: Protezione Live BTC + Cacciatore Ipervenduti + Netto Fee Reali OK.";
 
 let watchedOutperformers = [];
 global.lastBtcLivePrice = 0;
@@ -68,64 +68,6 @@ function calculateRSI(closes, period = 14) {
     return 100 - (100 / (1 + rs));
 }
 
-function calculateSMA(closes, period) {
-    if (!closes || closes.length < period) return closes ? closes[closes.length - 1] : 0;
-    const slice = closes.slice(-period);
-    return slice.reduce((a, b) => a + b, 0) / period;
-}
-
-function calculateEMA(closes, period) {
-    if (!closes || closes.length === 0) return 0;
-    const k = 2 / (period + 1);
-    let ema = closes[0];
-    for (let i = 1; i < closes.length; i++) {
-        ema = (closes[i] * k) + (ema * (1 - k));
-    }
-    return ema;
-}
-
-function calculateMACD(closes) {
-    if (!closes || closes.length < 35) return { macd: 0, signal: 0, histogram: 0 };
-    const fastEMA = calculateEMA(closes, 12);
-    const slowEMA = calculateEMA(closes, 26);
-    const macd = fastEMA - slowEMA;
-    const prevFast = calculateEMA(closes.slice(0, -1), 12);
-    const prevSlow = calculateEMA(closes.slice(0, -1), 26);
-    const prevMacd = prevFast - prevSlow;
-    const signal = (macd * (2 / 10)) + (prevMacd * (8 / 10));
-    const histogram = macd - signal;
-    return { macd, signal, histogram };
-}
-
-function calculateBollingerBands(closes, period = 20, stdDevMultiplier = 2) {
-    if (!closes || closes.length < period) return { upper: 0, middle: 0, lower: 0 };
-    const slice = closes.slice(-period);
-    const middle = slice.reduce((a, b) => a + b, 0) / period;
-    const variance = slice.reduce((sum, val) => sum + Math.pow(val - middle, 2), 0) / period;
-    const stdDev = Math.sqrt(variance);
-    return {
-        upper: middle + (stdDevMultiplier * stdDev),
-        middle: middle,
-        lower: middle - (stdDevMultiplier * stdDev)
-    };
-}
-
-function calculateMomentum(closes, period = 10) {
-    if (!closes || closes.length <= period) return 0;
-    return closes[closes.length - 1] - closes[closes.length - 1 - period];
-}
-
-function calculateStochastic(ohlcv, period = 14) {
-    if (!ohlcv || ohlcv.length < period) return { k: 50, d: 50 };
-    const slice = ohlcv.slice(-period);
-    const currentClose = slice[slice.length - 1][4];
-    const lowestLow = Math.min(...slice.map(c => c[3]));
-    const highestHigh = Math.max(...slice.map(c => c[2]));
-    if (highestHigh === lowestLow) return { k: 50, d: 50 };
-    const k = ((currentClose - lowestLow) / (highestHigh - lowestLow)) * 100;
-    return { k, d: k };
-}
-
 function detectChartPatterns(ohlcv) {
     if (!ohlcv || ohlcv.length < 15) return { score: 0, isGreenCandle: false };
     const lastCandle = ohlcv[ohlcv.length - 1];
@@ -162,37 +104,21 @@ async function runBotLoop() {
                 const eurBalance = balance.free['EUR'] || balance.free['ZEUR'] || 0;
                 console.log(`[${now}] Saldo disponibile EUR: €${eurBalance.toFixed(2)}`);
 
-                // 1. CONTROLLO LIVE TICKE DI BTC (Anticipa i crolli lampo in tempo reale)
+                // 1. CONTROLLO LIVE TICKER DI BTC (Protezione Flash Crash)
                 let isLiveFlashCrash = false;
                 try {
                     const btcTicker = await exchange.fetchTicker('BTC/EUR');
                     const btcCurrentLivePrice = btcTicker.last;
                     if (global.lastBtcLivePrice && btcCurrentLivePrice < global.lastBtcLivePrice * 0.985) {
-                        console.log(`[🚨 FLASH CRASH LIVE] BTC è sceso bruscamente in tempo reale a €${btcCurrentLivePrice}! Attivazione protezione immediata...`);
+                        console.log(`[🚨 FLASH CRASH LIVE] BTC è sceso bruscamente in tempo reale a €${btcCurrentLivePrice}! Protezione immediata...`);
                         isLiveFlashCrash = true;
                     }
                     global.lastBtcLivePrice = btcCurrentLivePrice;
                 } catch (e) {}
 
-                const macro = await getMacroSentiment();
-                let isBtcBullish = false;
+                const dynamicTakeProfit = 0.5; // TP lordo (+0.5%)
 
-                try {
-                    const btcOhlcv1h = await exchange.fetchOHLCV('BTC/EUR', '1h', undefined, 20);
-                    const btcCloses1h = btcOhlcv1h.map(c => c[4]);
-                    const btcPrice = btcCloses1h[btcCloses1h.length - 1];
-                    const btcOpen1h = btcOhlcv1h[btcOhlcv1h.length - 1][1];
-                    const btcChange1h = ((btcPrice - btcOpen1h) / btcOpen1h) * 100;
-
-                    isBtcBullish = btcChange1h > -0.5 && !isLiveFlashCrash;
-                    console.log(`[${now}] 📊 Termometro BTC Live: €${btcPrice.toFixed(2)} | Variazione 1h: ${btcChange1h.toFixed(2)}% | Flash Crash: ${isLiveFlashCrash ? 'SI' : 'NO'}`);
-                } catch (btcErr) {
-                    isBtcBullish = false;
-                }
-
-                const dynamicTakeProfit = 0.5; // TP ultrarapido (+0.5% lordo)
-
-                // 2. MONITORAGGIO, PROTEZIONE EMERGENZA E SBLOCCO PORTAFOGLIO
+                // 2. MONITORAGGIO PORTAFOGLIO CON CALCOLO NETTO DELLE FEE
                 const totalBalances = balance.total || {};
                 for (const currency of Object.keys(totalBalances)) {
                     if (stablecoinsToIgnore.includes(currency)) continue;
@@ -219,16 +145,18 @@ async function runBotLoop() {
                             } catch (e) {}
 
                             const grossPnlPercent = ((currentPrice - entryPrice) / entryPrice) * 100;
-                            const netPnlPercent = grossPnlPercent - 0.4; 
+                            // Calcolo puntuale delle fee stimate di Kraken (circa 0.26% a transazione, 0.52% round-trip)
+                            const estimatedFeePercent = 0.52; 
+                            const netPnlPercent = grossPnlPercent - estimatedFeePercent;
 
-                            console.log(`[Portafoglio] ${symbol} | Ingresso: €${entryPrice.toFixed(2)} | Attuale: €${currentPrice.toFixed(2)} | Lordo: ${grossPnlPercent.toFixed(2)}%`);
+                            console.log(`[Portafoglio] ${symbol} | Ingresso: €${entryPrice.toFixed(2)} | Attuale: €${currentPrice.toFixed(2)} | Lordo: ${grossPnlPercent.toFixed(2)}% | Netto Fee: ${netPnlPercent.toFixed(2)}%`);
 
                             const freeAmount = balance.free[currency] || 0;
                             if (freeAmount <= 0.0001) continue;
 
-                            // PROTEZIONE LIVE O SBLOCCO ROTAZIONE RAPIDA
-                            if (isLiveFlashCrash || grossPnlPercent >= dynamicTakeProfit || netPnlPercent >= 0.1 || grossPnlPercent <= -0.5) {
-                                console.log(`[🔄 CHIUSURA / ROTAZIONE] Vendita in corso su ${symbol} (Motivo: ${isLiveFlashCrash ? 'Flash Crash Live' : 'Target/Sblocco Raggiunto'})...`);
+                            // VENDITA / ROTAZIONE (Se scatta il flash crash, il TP lordo o il taglio netto)
+                            if (isLiveFlashCrash || grossPnlPercent >= dynamicTakeProfit || netPnlPercent >= 0.05 || grossPnlPercent <= -0.6) {
+                                console.log(`[🔄 ROTAZIONE / CHIUSURA] Vendita in corso su ${symbol} (Lordo: ${grossPnlPercent.toFixed(2)}% | Netto: ${netPnlPercent.toFixed(2)}%)...`);
                                 await exchange.createMarketSellOrder(symbol, freeAmount);
                                 await new Promise(resolve => setTimeout(resolve, 5000));
                                 continue;
@@ -239,13 +167,12 @@ async function runBotLoop() {
                     }
                 }
 
-                // Se c'è un crollo live in corso, saltiamo i nuovi acquisti per restare protetti in EUR
                 if (isLiveFlashCrash) {
                     await new Promise(resolve => setTimeout(resolve, 30000));
                     continue;
                 }
 
-                // 3. SCANSIONE A 360° KRAKEN + CMC TOP GAINERS & IPERVENDUTI IN RIMBALZO
+                // 3. SCANSIONE A 360° KRAKEN + CMC & IPERVENDUTI IN RIMBALZO
                 let allKrakenPairs = Object.keys(exchange.markets).filter(symbol => {
                     if (!symbol.endsWith('/EUR') || !exchange.markets[symbol].active) return false;
                     const base = symbol.split('/')[0].replace(/^X/, '').replace(/^Z/, '');
@@ -259,72 +186,3 @@ async function runBotLoop() {
                     try {
                         const cmcResponse = await axios.get('https://pro-api.coinmarketcap.com/v1/cryptocurrency/listings/latest', {
                             headers: { 'X-CMC_PRO_API_KEY': CMC_API_KEY },
-                            params: { start: 1, limit: 300, sort: 'percent_change_24h', sort_dir: 'desc', convert: 'EUR' }
-                        });
-                        for (const coin of cmcResponse.data.data) {
-                            const baseSym = coin.symbol;
-                            if (stablecoinsToIgnore.includes(baseSym)) continue;
-                            const change24h = coin.quote?.EUR?.percent_change_24h || 0;
-                            if (change24h > 0) {
-                                const sym = `${baseSym}/EUR`;
-                                if (exchange.markets[sym] && exchange.markets[sym].active) {
-                                    cmcTopMovers.push(sym);
-                                }
-                            }
-                        }
-                    } catch (e) {}
-                }
-
-                let prioritizedAssets = [...new Set([...cmcTopMovers, ...allKrakenPairs])];
-
-                for (const symbol of prioritizedAssets) {
-                    try {
-                        if (!exchange.markets[symbol]) continue;
-                        
-                        const baseCurrency = symbol.split('/')[0];
-                        if (balance.free[baseCurrency] && balance.free[baseCurrency] > 0.0001) continue; 
-
-                        const ohlcv5m = await exchange.fetchOHLCV(symbol, '5m', undefined, 30);
-                        const closes5m = ohlcv5m.map(c => c[4]);
-                        const currentPrice = closes5m[closes5m.length - 1];
-                        
-                        const rsi5m = calculateRSI(closes5m, 14);
-                        const prevRsi5m = calculateRSI(closes5m.slice(0, -1), 14);
-                        const { isGreenCandle } = detectChartPatterns(ohlcv5m);
-
-                        // CACCIATORE DI IPERVENDUTI IN RIMBALZO (Oversold Bounce)
-                        const isOversoldRebound = (prevRsi5m <= 35 && rsi5m > prevRsi5m && isGreenCandle);
-
-                        if (!isGreenCandle && !isOversoldRebound) continue;
-
-                        let targetInvestmentSize = 5; 
-                        if (eurBalance < targetInvestmentSize) targetInvestmentSize = eurBalance;
-
-                        if (eurBalance >= 5) {
-                            const reason = isOversoldRebound ? "Oversold Bounce (Rimbalzo Ipervenduto 🚀)" : "Candela Verde Attiva";
-                            console.log(`[🚀 NUOVO INGRESSO] Acquisto su ${symbol} | Motivo: ${reason} | Prezzo: €${currentPrice}`);
-                            
-                            const amountToBuy = targetInvestmentSize / currentPrice;
-                            const order = await exchange.createMarketBuyOrder(symbol, amountToBuy);
-                            console.log(`[SUCCESSO] Acquistati €${targetInvestmentSize} di ${symbol}! ID:`, order.id);
-                            lastLog = `[${now}] Acquistati €${targetInvestmentSize} di ${symbol} (${reason})`;
-                            await new Promise(resolve => setTimeout(resolve, 15000));
-                            break;
-                        }
-                    } catch (altErr) {}
-                }
-            }
-        } catch (err) {
-            console.log("Errore nel ciclo principale:", err.message);
-        }
-
-        await new Promise(resolve => setTimeout(resolve, 60000));
-    }
-}
-
-app.listen(PORT, () => {
-    console.log(`Server in ascolto sulla porta ${PORT}`);
-    setTimeout(() => {
-        runBotLoop();
-    }, 3000);
-});
