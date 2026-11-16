@@ -17,7 +17,7 @@ const exchange = new ccxt.kraken({
 });
 
 let botRunning = true;
-let lastLog = "Bot avviato: TP Reale Profittevole (>1.2% Lordo) + Protezione Live BTC.";
+let lastLog = "Bot avviato: Fast-Cut Immediato (-0.3%) + TP Reale + Protezione Live BTC.";
 let watchedOutperformers = [];
 global.lastBtcLivePrice = 0;
 
@@ -88,16 +88,17 @@ async function runBotLoop() {
                     const btcTicker = await exchange.fetchTicker('BTC/EUR');
                     const btcPrice = btcTicker.last;
                     if (global.lastBtcLivePrice && btcPrice < global.lastBtcLivePrice * 0.985) {
-                        console.log(`[🚨 FLASH CRASH LIVE] BTC a €${btcPrice}! Protezione attiva.`);
+                        console.log(`[🚨 FLASH CRASH LIVE] BTC a €${btcPrice}! Protezione immediata.`);
                         isLiveFlashCrash = true;
                     }
                     global.lastBtcLivePrice = btcPrice;
                 } catch (e) {}
 
-                // SOGLIA CORRETTA: 1.2% Lordo garantisce un utile netto reale dopo ~0.52% di fee Kraken
-                const dynamicTakeProfit = 1.2; 
+                // Parametri di uscita reattivi
+                const dynamicTakeProfit = 1.2;  // TP lordo per utile netto reale
+                const fastCutThreshold = -0.3;  // Taglio immediato se il trend non parte e scende dello 0.3%
 
-                // 2. PORTAFOGLIO & NETTO FEE REALE
+                // 2. PORTAFOGLIO & NETTO FEE REALE + TAGLIO ISTANTANEO
                 const totalBalances = balance.total || {};
                 for (const currency of Object.keys(totalBalances)) {
                     if (stablecoinsToIgnore.includes(currency)) continue;
@@ -130,11 +131,13 @@ async function runBotLoop() {
                             const freeAmount = balance.free[currency] || 0;
                             if (freeAmount <= 0.0001) continue;
 
-                            // Chiusura solo se c'è un vero utile netto (> +0.6%) o se scatta il blocco d'emergenza / stop loss
-                            if (isLiveFlashCrash || grossPnlPercent >= dynamicTakeProfit || netPnlPercent >= 0.6 || grossPnlPercent <= -0.8) {
-                                console.log(`[🔄 ROTAZIONE] Vendita ${symbol} (Lordo: ${grossPnlPercent.toFixed(2)}% | Netto Reale: ${netPnlPercent.toFixed(2)}%)...`);
+                            // USCITA IMMEDIATA: Se c'è flash crash, se raggiunge il TP, se fa utile netto o SE IL TREND NON PARTE (Fast-Cut <= -0.3%)
+                            if (isLiveFlashCrash || grossPnlPercent >= dynamicTakeProfit || netPnlPercent >= 0.5 || grossPnlPercent <= fastCutThreshold) {
+                                const reason = grossPnlPercent <= fastCutThreshold ? "⚡ Fast-Cut (Trend non partito)" : "Rotazione / Take-Profit";
+                                console.log(`[🔄 CHIUSURA] ${symbol} | Motivo: ${reason} (Lordo: ${grossPnlPercent.toFixed(2)}% | Netto: ${netPnlPercent.toFixed(2)}%)...`);
+                                
                                 await exchange.createMarketSellOrder(symbol, freeAmount);
-                                await new Promise(resolve => setTimeout(resolve, 5000));
+                                await new Promise(resolve => setTimeout(resolve, 3000));
                                 continue;
                             }
                         } catch (errPort) {
@@ -148,7 +151,7 @@ async function runBotLoop() {
                     continue;
                 }
 
-                // 3. SCANSIONE A 360° KRAKEN + CMC
+                // 3. SCANSIONE A 360° KRAKEN + CMC & IPERVENDUTI IN RIMBALZO
                 let allKrakenPairs = Object.keys(exchange.markets).filter(symbol => {
                     if (!symbol.endsWith('/EUR') || !exchange.markets[symbol].active) return false;
                     const base = symbol.split('/')[0].replace(/^X/, '').replace(/^Z/, '');
@@ -201,7 +204,7 @@ async function runBotLoop() {
                             const amountToBuy = targetInvestmentSize / currentPrice;
                             const order = await exchange.createMarketBuyOrder(symbol, amountToBuy);
                             console.log(`[SUCCESSO] Acquistati €${targetInvestmentSize} di ${symbol}! ID:`, order.id);
-                            lastLog = `[${now}] Acquistati €${targetInvestmentSize} di ${symbol}`;
+                            lastLog = `[${now}] Acquistati €${targetInvestmentSize} di ${symbol} (${reason})`;
                             await new Promise(resolve => setTimeout(resolve, 15000));
                             break;
                         }
