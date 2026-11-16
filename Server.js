@@ -17,9 +17,10 @@ const exchange = new ccxt.kraken({
 });
 
 let botRunning = true;
-let lastLog = "Bot avviato: Rotazione Dinamica Momentum + Scansione Totale Kraken + TP Rapido.";
+let lastLog = "Bot avviato: Protezione Live BTC + Cacciatore Ipervenduti + Rotazione Rapida EUR.";
 
 let watchedOutperformers = [];
+global.lastBtcLivePrice = 0;
 
 // Lista di stablecoin o asset fiat equivalenti da ignorare completamente
 const stablecoinsToIgnore = ['USDC', 'EURC', 'USDT', 'DAI', 'PYUSD', 'ZEUR', 'KFEE'];
@@ -31,7 +32,7 @@ app.get('/', (req, res) => {
             <body style="font-family: Arial; padding: 20px; background: #111; color: #fff;">
                 <h1>Cryptobot39 - Stato: ${botRunning ? 'ATTIVO & OPERATIVO' : 'FERMO'}</h1>
                 <p><b>Ultima attività:</b> ${lastLog}</p>
-                <p><b>Watchlist Dinamica / Kraken:</b> ${watchedOutperformers.length > 0 ? watchedOutperformers.join(', ') : 'Sincronizzazione in corso...'}</p>
+                <p><b>Watchlist Rotazione / Kraken:</b> ${watchedOutperformers.length > 0 ? watchedOutperformers.join(', ') : 'Sincronizzazione in corso...'}</p>
             </body>
         </html>
     `);
@@ -125,45 +126,19 @@ function calculateStochastic(ohlcv, period = 14) {
     return { k, d: k };
 }
 
-function calculateFibonacciLevels(ohlcv) {
-    if (!ohlcv || ohlcv.length < 30) return { fib382: 0, fib500: 0, fib618: 0 };
-    const highs = ohlcv.map(c => c[2]);
-    const lows = ohlcv.map(c => c[3]);
-    const maxHigh = Math.max(...highs.slice(-30));
-    const minLow = Math.min(...lows.slice(-30));
-    const diff = maxHigh - minLow;
-
-    return {
-        fib382: maxHigh - (diff * 0.382),
-        fib500: maxHigh - (diff * 0.500),
-        fib618: maxHigh - (diff * 0.618)
-    };
-}
-
-function findSupportAndResistance(ohlcv) {
-    if (!ohlcv || ohlcv.length < 20) return { support: 0, resistance: 0 };
-    const lows = ohlcv.map(c => c[3]); 
-    const highs = ohlcv.map(c => c[2]); 
-    const support = Math.min(...lows.slice(-20)); 
-    const resistance = Math.max(...highs.slice(-20)); 
-    return { support, resistance };
-}
-
 function detectChartPatterns(ohlcv) {
-    if (!ohlcv || ohlcv.length < 15) return { pattern: "NONE", score: 0, isGreenCandle: false };
+    if (!ohlcv || ohlcv.length < 15) return { score: 0, isGreenCandle: false };
     const lastCandle = ohlcv[ohlcv.length - 1];
     const isGreenCandle = lastCandle[4] > lastCandle[1];
     const closes = ohlcv.map(c => c[4]);
     const lows = ohlcv.map(c => c[3]);
-    let pattern = "NORMAL_ACTION";
     let score = 0;
     const currentClose = closes[closes.length - 1];
     const recentMin = Math.min(...lows.slice(-10));
     if (Math.abs(currentClose - recentMin) / recentMin < 0.01 && isGreenCandle) {
-        pattern = "SUPPORT_BOUNCE_CONFIRMED";
         score += 3;
     }
-    return { pattern, score, isGreenCandle };
+    return { score, isGreenCandle };
 }
 
 async function getMacroSentiment() {
@@ -174,41 +149,6 @@ async function getMacroSentiment() {
     } catch (e) {
         return { value: 50, label: "Neutral", isExtremeFear: false };
     }
-}
-
-async function backtestPriceLevel(ohlcv, targetPrice, takeProfitPct, stopLossPct) {
-    if (!ohlcv || ohlcv.length < 30) return { winRate: 100, status: "PASSED" };
-    
-    let simulatedWins = 0;
-    let simulatedLosses = 0;
-
-    for (let i = 20; i < ohlcv.length - 5; i++) {
-        const historicalEntry = ohlcv[i][4]; 
-        const futureCandles = ohlcv.slice(i + 1, i + 6); 
-
-        let hitTP = false;
-        let hitSL = false;
-
-        for (const fc of futureCandles) {
-            const high = fc[2];
-            const low = fc[3];
-            const tpPrice = historicalEntry * (1 + (takeProfitPct / 100));
-            const slPrice = historicalEntry * (1 - (stopLossPct / 100));
-
-            if (high >= tpPrice) { hitTP = true; break; }
-            if (low <= slPrice) { hitSL = true; break; }
-        }
-
-        if (hitTP && !hitSL) simulatedWins++;
-        else if (hitSL && !hitTP) simulatedLosses++;
-    }
-
-    const totalSims = simulatedWins + simulatedLosses;
-    if (totalSims === 0) return { winRate: 100, status: "PASSED" };
-
-    const winRate = (simulatedWins / totalSims) * 100;
-    if (winRate < 40) return { winRate, status: "PENALIZED" };
-    return { winRate, status: "PASSED" };
 }
 
 async function runBotLoop() {
@@ -222,49 +162,37 @@ async function runBotLoop() {
                 const eurBalance = balance.free['EUR'] || balance.free['ZEUR'] || 0;
                 console.log(`[${now}] Saldo disponibile EUR: €${eurBalance.toFixed(2)}`);
 
+                // 1. CONTROLLO LIVE TICKE DI BTC (Anticipa i crolli lampo in tempo reale)
+                let isLiveFlashCrash = false;
+                try {
+                    const btcTicker = await exchange.fetchTicker('BTC/EUR');
+                    const btcCurrentLivePrice = btcTicker.last;
+                    if (global.lastBtcLivePrice && btcCurrentLivePrice < global.lastBtcLivePrice * 0.985) {
+                        console.log(`[🚨 FLASH CRASH LIVE] BTC è sceso bruscamente in tempo reale a €${btcCurrentLivePrice}! Attivazione protezione immediata...`);
+                        isLiveFlashCrash = true;
+                    }
+                    global.lastBtcLivePrice = btcCurrentLivePrice;
+                } catch (e) {}
+
                 const macro = await getMacroSentiment();
                 let isBtcBullish = false;
-                let isPanicCrash = false;
-                let btcChange1h = 0;
-                let btcPrice = 0;
 
                 try {
-                    const btcOhlcv4h = await exchange.fetchOHLCV('BTC/EUR', '4h', undefined, 50);
-                    const btcOhlcv1h = await exchange.fetchOHLCV('BTC/EUR', '1h', undefined, 50);
-                    const btcOhlcv15m = await exchange.fetchOHLCV('BTC/EUR', '15m', undefined, 10);
-                    
-                    const btcCloses4h = btcOhlcv4h.map(c => c[4]);
+                    const btcOhlcv1h = await exchange.fetchOHLCV('BTC/EUR', '1h', undefined, 20);
                     const btcCloses1h = btcOhlcv1h.map(c => c[4]);
-                    const btcCloses15m = btcOhlcv15m.map(c => c[4]);
-                    
-                    btcPrice = btcCloses15m[btcCloses15m.length - 1];
-                    
-                    const btcRsi4h = calculateRSI(btcCloses4h, 14);
-                    const btcRsi1h = calculateRSI(btcCloses1h, 14);
-                    
-                    const btcSma20_4h = calculateSMA(btcCloses4h, 20);
-                    const btcSma20_1h = calculateSMA(btcCloses1h, 20);
-
+                    const btcPrice = btcCloses1h[btcCloses1h.length - 1];
                     const btcOpen1h = btcOhlcv1h[btcOhlcv1h.length - 1][1];
-                    btcChange1h = ((btcPrice - btcOpen1h) / btcOpen1h) * 100;
+                    const btcChange1h = ((btcPrice - btcOpen1h) / btcOpen1h) * 100;
 
-                    const is4hStructureBullish = (btcPrice >= btcSma20_4h && btcRsi4h >= 48);
-                    const is1hStructureBullish = (btcPrice >= btcSma20_1h && btcRsi1h >= 45);
-
-                    isBtcBullish = is4hStructureBullish && is1hStructureBullish;
-                    isPanicCrash = (btcChange1h <= -4.0) || (btcChange1h <= -3.0 && macro.isExtremeFear);
-
-                    lastLog = `[${now}] 📊 Termometro BTC: €${btcPrice.toFixed(2)} | F&G: ${macro.value} | Stato: ${isPanicCrash ? '🚨 PANIC' : (isBtcBullish ? 'BULLISH' : 'BEARISH / LATERALE (TP Adattivo Rapido Attivo)')}`;
-                    console.log(lastLog);
+                    isBtcBullish = btcChange1h > -0.5 && !isLiveFlashCrash;
+                    console.log(`[${now}] 📊 Termometro BTC Live: €${btcPrice.toFixed(2)} | Variazione 1h: ${btcChange1h.toFixed(2)}% | Flash Crash: ${isLiveFlashCrash ? 'SI' : 'NO'}`);
                 } catch (btcErr) {
-                    console.log(`[${now}] 🙏 Errore lettura termometro BTC:`, btcErr.message);
                     isBtcBullish = false;
                 }
 
-                const dynamicStopLoss = isBtcBullish ? -5.0 : -2.0;    
-                const dynamicTakeProfit = isBtcBullish ? 1.4 : 0.8;     
+                const dynamicTakeProfit = 0.5; // TP ultrarapido (+0.5% lordo)
 
-                // 1. MONITORAGGIO PORTAFOGLIO E USCITE RAPIDE
+                // 2. MONITORAGGIO, PROTEZIONE EMERGENZA E SBLOCCO PORTAFOGLIO
                 const totalBalances = balance.total || {};
                 for (const currency of Object.keys(totalBalances)) {
                     if (stablecoinsToIgnore.includes(currency)) continue;
@@ -291,37 +219,16 @@ async function runBotLoop() {
                             } catch (e) {}
 
                             const grossPnlPercent = ((currentPrice - entryPrice) / entryPrice) * 100;
-                            const estimatedFeePercent = 0.5; 
-                            const netPnlPercent = grossPnlPercent - estimatedFeePercent;
+                            const netPnlPercent = grossPnlPercent - 0.4; 
 
-                            console.log(`[Portafoglio] ${symbol} | Qty: ${totalAmount} | Ingresso: €${entryPrice.toFixed(2)} | Attuale: €${currentPrice.toFixed(2)} | Lordo: ${grossPnlPercent.toFixed(2)}% | Netto: ${netPnlPercent.toFixed(2)}%`);
+                            console.log(`[Portafoglio] ${symbol} | Ingresso: €${entryPrice.toFixed(2)} | Attuale: €${currentPrice.toFixed(2)} | Lordo: ${grossPnlPercent.toFixed(2)}%`);
 
                             const freeAmount = balance.free[currency] || 0;
                             if (freeAmount <= 0.0001) continue;
 
-                            if (isPanicCrash) {
-                                if (netPnlPercent < 1.2) {
-                                    console.log(`[🚨 PANIC EXIT] Crollo BTC! Liquidazione su ${symbol} in EUR (Netto: ${netPnlPercent.toFixed(2)}%)...`);
-                                    await exchange.createMarketSellOrder(symbol, freeAmount);
-                                    await new Promise(resolve => setTimeout(resolve, 5000));
-                                    continue;
-                                }
-                            }
-
-                            if (netPnlPercent >= dynamicTakeProfit) {
-                                console.log(`[TAKE-PROFIT ROTAZIONE] Target raggiunto su ${symbol} (+${netPnlPercent.toFixed(2)}% effettivi). Vendita in EUR per ruotare su asset più forti...`);
-                                await exchange.createMarketSellOrder(symbol, freeAmount);
-                                await new Promise(resolve => setTimeout(resolve, 5000));
-                                continue;
-                            } 
-                            else if (netPnlPercent <= -0.7) {
-                                console.log(`[⚡ FAST-CUT] Il trade rallenta (${netPnlPercent.toFixed(2)}% netto). Uscita immediata in EUR...`);
-                                await exchange.createMarketSellOrder(symbol, freeAmount);
-                                await new Promise(resolve => setTimeout(resolve, 5000));
-                                continue;
-                            }
-                            else if (netPnlPercent <= dynamicStopLoss) {
-                                console.log(`[STOP-LOSS] Soglia raggiunta su ${symbol} (${netPnlPercent.toFixed(2)}% netto). Chiusura in EUR...`);
+                            // PROTEZIONE LIVE O SBLOCCO ROTAZIONE RAPIDA
+                            if (isLiveFlashCrash || grossPnlPercent >= dynamicTakeProfit || netPnlPercent >= 0.1 || grossPnlPercent <= -0.5) {
+                                console.log(`[🔄 CHIUSURA / ROTAZIONE] Vendita in corso su ${symbol} (Motivo: ${isLiveFlashCrash ? 'Flash Crash Live' : 'Target/Sblocco Raggiunto'})...`);
                                 await exchange.createMarketSellOrder(symbol, freeAmount);
                                 await new Promise(resolve => setTimeout(resolve, 5000));
                                 continue;
@@ -332,7 +239,13 @@ async function runBotLoop() {
                     }
                 }
 
-                // 2. LISTA COMPLETA KRAKEN (Shuffle Casuale per coprire tutto)
+                // Se c'è un crollo live in corso, saltiamo i nuovi acquisti per restare protetti in EUR
+                if (isLiveFlashCrash) {
+                    await new Promise(resolve => setTimeout(resolve, 30000));
+                    continue;
+                }
+
+                // 3. SCANSIONE A 360° KRAKEN + CMC TOP GAINERS & IPERVENDUTI IN RIMBALZO
                 let allKrakenPairs = Object.keys(exchange.markets).filter(symbol => {
                     if (!symbol.endsWith('/EUR') || !exchange.markets[symbol].active) return false;
                     const base = symbol.split('/')[0].replace(/^X/, '').replace(/^Z/, '');
@@ -341,102 +254,59 @@ async function runBotLoop() {
                 
                 allKrakenPairs = shuffleArray(allKrakenPairs);
 
-                // 3. CMC TOP VOLUMI & MOMENTUM (Fino a 300 asset)
                 let cmcTopMovers = [];
                 if (CMC_API_KEY) {
                     try {
                         const cmcResponse = await axios.get('https://pro-api.coinmarketcap.com/v1/cryptocurrency/listings/latest', {
                             headers: { 'X-CMC_PRO_API_KEY': CMC_API_KEY },
-                            params: { start: 1, limit: 300, sort: 'volume_24h', sort_dir: 'desc', convert: 'EUR' }
+                            params: { start: 1, limit: 300, sort: 'percent_change_24h', sort_dir: 'desc', convert: 'EUR' }
                         });
                         for (const coin of cmcResponse.data.data) {
                             const baseSym = coin.symbol;
                             if (stablecoinsToIgnore.includes(baseSym)) continue;
-                            
-                            const volume24hEUR = coin.quote?.EUR?.volume_24h || 0;
                             const change24h = coin.quote?.EUR?.percent_change_24h || 0;
-                            
-                            // Selezioniamo asset con volumi reali (> 500k €) che mostrano forza (change24h > 0)
-                            if (volume24hEUR >= 500000 && change24h > 0) {
+                            if (change24h > 0) {
                                 const sym = `${baseSym}/EUR`;
                                 if (exchange.markets[sym] && exchange.markets[sym].active) {
                                     cmcTopMovers.push(sym);
-                                    if (!watchedOutperformers.includes(sym)) {
-                                        watchedOutperformers.push(sym);
-                                    }
                                 }
                             }
                         }
-                    } catch (e) {
-                        console.log("⚠️ Avviso CMC API:", e.message);
-                    }
+                    } catch (e) {}
                 }
 
-                // Unione per dare priorità ai top volumi attivi, esplorando comunque tutto il listino
-                let prioritizedAssets = [...new Set([...watchedOutperformers, ...cmcTopMovers, ...allKrakenPairs])];
+                let prioritizedAssets = [...new Set([...cmcTopMovers, ...allKrakenPairs])];
 
                 for (const symbol of prioritizedAssets) {
                     try {
                         if (!exchange.markets[symbol]) continue;
                         
                         const baseCurrency = symbol.split('/')[0];
-                        if (balance.free[baseCurrency] && balance.free[baseCurrency] > 0.0001) {
-                            watchedOutperformers = watchedOutperformers.filter(s => s !== symbol);
-                            continue; 
-                        }
+                        if (balance.free[baseCurrency] && balance.free[baseCurrency] > 0.0001) continue; 
 
-                        const ohlcv5m = await exchange.fetchOHLCV(symbol, '5m', undefined, 50);
-                        const ohlcv15m = await exchange.fetchOHLCV(symbol, '15m', undefined, 50);
+                        const ohlcv5m = await exchange.fetchOHLCV(symbol, '5m', undefined, 30);
                         const closes5m = ohlcv5m.map(c => c[4]);
-                        const closes15m = ohlcv15m.map(c => c[4]);
-
                         const currentPrice = closes5m[closes5m.length - 1];
-
+                        
                         const rsi5m = calculateRSI(closes5m, 14);
-                        const sma20 = calculateSMA(closes15m, 20);
-                        const sma50 = calculateSMA(closes15m, 50);
-                        const macdData = calculateMACD(closes15m);
-                        const bollinger = calculateBollingerBands(closes15m, 20, 2);
-                        const momentum = calculateMomentum(closes5m, 10);
-                        const stochastic = calculateStochastic(ohlcv5m, 14);
-                        const fib = calculateFibonacciLevels(ohlcv15m);
-                        const { support } = findSupportAndResistance(ohlcv15m);
+                        const prevRsi5m = calculateRSI(closes5m.slice(0, -1), 14);
                         const { isGreenCandle } = detectChartPatterns(ohlcv5m);
 
-                        const backtest = await backtestPriceLevel(ohlcv15m, currentPrice, dynamicTakeProfit, Math.abs(dynamicStopLoss));
-                        if (backtest.status === "PENALIZED") continue;
+                        // CACCIATORE DI IPERVENDUTI IN RIMBALZO (Oversold Bounce)
+                        const isOversoldRebound = (prevRsi5m <= 35 && rsi5m > prevRsi5m && isGreenCandle);
 
-                        let targetInvestmentSize = isBtcBullish ? 12 : 5; 
+                        if (!isGreenCandle && !isOversoldRebound) continue;
+
+                        let targetInvestmentSize = 5; 
                         if (eurBalance < targetInvestmentSize) targetInvestmentSize = eurBalance;
 
-                        if (!isGreenCandle) continue;
-
-                        let confluenceScore = 0;
-                        let reasonsList = [];
-
-                        if (currentPrice >= sma20 || currentPrice >= sma50) { confluenceScore++; reasonsList.push("Trend OK"); }
-                        if (macdData.histogram > 0 || macdData.macd > macdData.signal) { confluenceScore++; reasonsList.push("MACD OK"); }
-                        if (currentPrice <= bollinger.lower * 1.02 || (support > 0 && currentPrice <= support * 1.02) || Math.abs(currentPrice - fib.fib618) / fib.fib618 < 0.025) { confluenceScore++; reasonsList.push("Supporto/Range OK"); }
-                        if (rsi5m >= 30 && rsi5m <= 75 && stochastic.k < 85) { confluenceScore++; reasonsList.push("RSI Sano"); }
-                        if (momentum > 0) { confluenceScore++; reasonsList.push("Momentum Positivo"); }
-
-                        const isTopMover = cmcTopMovers.includes(symbol) || watchedOutperformers.includes(symbol);
-                        let buyCondition = false;
-                        let reason = "";
-
-                        const requiredScore = isBtcBullish ? 4 : (isTopMover ? 3 : 4);
-
-                        if (!isPanicCrash && confluenceScore >= requiredScore) {
-                            buyCondition = (eurBalance >= 5);
-                            reason = `Catturata Forza Relativa (Score: ${confluenceScore}/5 - Top Volume CMC: ${isTopMover ? 'Sì' : 'No'})`;
-                            watchedOutperformers = watchedOutperformers.filter(s => s !== symbol);
-                        }
-
-                        if (buyCondition) {
-                            console.log(`[🚀 ACCENSIONE ROTAZIONE] Ingresso su ${symbol} | Motivo: ${reason} | Prezzo: €${currentPrice}`);
+                        if (eurBalance >= 5) {
+                            const reason = isOversoldRebound ? "Oversold Bounce (Rimbalzo Ipervenduto 🚀)" : "Candela Verde Attiva";
+                            console.log(`[🚀 NUOVO INGRESSO] Acquisto su ${symbol} | Motivo: ${reason} | Prezzo: €${currentPrice}`);
+                            
                             const amountToBuy = targetInvestmentSize / currentPrice;
                             const order = await exchange.createMarketBuyOrder(symbol, amountToBuy);
-                            console.log(`[SUCCESSO ACQUISTO] Acquistati ~€${targetInvestmentSize} di ${symbol} in EUR! ID:`, order.id);
+                            console.log(`[SUCCESSO] Acquistati €${targetInvestmentSize} di ${symbol}! ID:`, order.id);
                             lastLog = `[${now}] Acquistati €${targetInvestmentSize} di ${symbol} (${reason})`;
                             await new Promise(resolve => setTimeout(resolve, 15000));
                             break;
