@@ -17,9 +17,12 @@ const exchange = new ccxt.kraken({
 });
 
 let botRunning = true;
-let lastLog = "Bot avviato: Shuffle Casuale + TP Rapido Laterale + Fast-Cut Netto (-0.7%).";
+let lastLog = "Bot avviato: Shuffle Casuale + TP Rapido Laterale + Filtro Anti-Stablecoin EUR.";
 
 let watchedOutperformers = [];
+
+// Lista di stablecoin o asset fiat equivalenti da NON trattare come altcoin da trading
+const stablecoinsToIgnore = ['USDC', 'EURC', 'USDT', 'DAI', 'PYUSD', 'ZEUR', 'KFEE'];
 
 app.get('/', (req, res) => {
     res.send(`
@@ -218,9 +221,9 @@ async function runBotLoop() {
                 const now = new Date().toLocaleString();
                 await exchange.loadMarkets();
 
-                // 1. Saldi su Kraken
+                // 1. Saldi su Kraken (Focalizzati rigorosamente su EUR)
                 const balance = await exchange.fetchBalance();
-                const eurBalance = balance.free['EUR'] || 0;
+                const eurBalance = balance.free['EUR'] || balance.free['ZEUR'] || 0;
                 console.log(`[${now}] Saldo disponibile EUR: €${eurBalance.toFixed(2)}`);
 
                 // 2. Termometro BTC & Sentiment Macro
@@ -263,20 +266,21 @@ async function runBotLoop() {
                     isBtcBullish = false;
                 }
 
-                // Parametri dinamici: in laterale/bearish abbassiamo il TP a 0.8% lordo (~0.3% netto pulito) per chiudere subito i micro-movimenti!
+                // Parametri dinamici: in laterale/bearish TP a 0.8% lordo (~0.3% netto pulito)
                 const dynamicStopLoss = isBtcBullish ? -5.0 : -2.0;    
                 const dynamicTakeProfit = isBtcBullish ? 1.4 : 0.8;     
 
-                // 3. MONITORAGGIO PRIORITARIO PORTAFOGLIO (Con calcolo P&L Netto e Fee ~0.5%)
+                // 3. MONITORAGGIO PRIORITARIO PORTAFOGLIO (Escludendo stablecoin e gestendo solo crypto reali)
                 const totalBalances = balance.total || {};
                 for (const currency of Object.keys(totalBalances)) {
-                    if (currency === 'EUR' || currency === 'ZEUR' || currency === 'KFEE') continue;
+                    if (stablecoinsToIgnore.includes(currency)) continue;
+                    let cleanCurrency = currency.replace(/^X/, '').replace(/^Z/, '');
+                    if (cleanCurrency === 'XBT') cleanCurrency = 'BTC';
+                    if (stablecoinsToIgnore.includes(cleanCurrency)) continue;
+
                     const totalAmount = balance.total[currency] || 0;
                     if (totalAmount > 0.0001) {
-                        let cleanCurrency = currency.replace(/^X/, '').replace(/^Z/, '');
-                        if (cleanCurrency === 'XBT') cleanCurrency = 'BTC';
                         const symbol = `${cleanCurrency}/EUR`;
-                        
                         if (!exchange.markets[symbol]) continue;
 
                         try {
@@ -292,22 +296,20 @@ async function runBotLoop() {
                                     entryPrice = buyTrades[buyTrades.length - 1].price;
                                     foundRealTrade = true;
                                 }
-                            } catch (e) {
-                                console.log(`[⚠️ Avviso Storico] Impossibile leggere i trade passati per ${symbol}:`, e.message);
-                            }
+                            } catch (e) {}
 
                             const grossPnlPercent = ((currentPrice - entryPrice) / entryPrice) * 100;
                             const estimatedFeePercent = 0.5; 
                             const netPnlPercent = grossPnlPercent - estimatedFeePercent;
 
-                            console.log(`[Portafoglio] ${symbol} | Qty: ${totalAmount} | Ingresso: €${entryPrice.toFixed(2)} (${foundRealTrade ? 'Reale' : 'Stimato'}) | Attuale: €${currentPrice.toFixed(2)} | Lordo: ${grossPnlPercent.toFixed(2)}% | Netto: ${netPnlPercent.toFixed(2)}%`);
+                            console.log(`[Portafoglio] ${symbol} | Qty: ${totalAmount} | Ingresso: €${entryPrice.toFixed(2)} | Attuale: €${currentPrice.toFixed(2)} | Lordo: ${grossPnlPercent.toFixed(2)}% | Netto: ${netPnlPercent.toFixed(2)}%`);
 
                             const freeAmount = balance.free[currency] || 0;
                             if (freeAmount <= 0.0001) continue;
 
                             if (isPanicCrash) {
                                 if (netPnlPercent < 1.2) {
-                                    console.log(`[🚨 PANIC EXIT] Crollo BTC! Liquidazione su ${symbol} (Netto: ${netPnlPercent.toFixed(2)}%)...`);
+                                    console.log(`[🚨 PANIC EXIT] Crollo BTC! Liquidazione su ${symbol} in EUR (Netto: ${netPnlPercent.toFixed(2)}%)...`);
                                     await exchange.createMarketSellOrder(symbol, freeAmount);
                                     await new Promise(resolve => setTimeout(resolve, 5000));
                                     continue;
@@ -315,19 +317,19 @@ async function runBotLoop() {
                             }
 
                             if (netPnlPercent >= dynamicTakeProfit) {
-                                console.log(`[TAKE-PROFIT NETTO RAPIDO] Target raggiunto su ${symbol} (+${netPnlPercent.toFixed(2)}% effettivi). Vendita immediata...`);
+                                console.log(`[TAKE-PROFIT NETTO RAPIDO] Target raggiunto su ${symbol} (+${netPnlPercent.toFixed(2)}% effettivi). Vendita immediata in EUR...`);
                                 await exchange.createMarketSellOrder(symbol, freeAmount);
                                 await new Promise(resolve => setTimeout(resolve, 5000));
                                 continue;
                             } 
                             else if (netPnlPercent <= -0.7) {
-                                console.log(`[⚡ FAST-CUT] Il trade non parte e va in rosso (${netPnlPercent.toFixed(2)}% netto). Chiusura immediata...`);
+                                console.log(`[⚡ FAST-CUT] Il trade non parte e va in rosso (${netPnlPercent.toFixed(2)}% netto). Chiusura immediata in EUR...`);
                                 await exchange.createMarketSellOrder(symbol, freeAmount);
                                 await new Promise(resolve => setTimeout(resolve, 5000));
                                 continue;
                             }
                             else if (netPnlPercent <= dynamicStopLoss) {
-                                console.log(`[STOP-LOSS] Soglia raggiunta su ${symbol} (${netPnlPercent.toFixed(2)}% netto). Chiusura...`);
+                                console.log(`[STOP-LOSS] Soglia raggiunta su ${symbol} (${netPnlPercent.toFixed(2)}% netto). Chiusura in EUR...`);
                                 await exchange.createMarketSellOrder(symbol, freeAmount);
                                 await new Promise(resolve => setTimeout(resolve, 5000));
                                 continue;
@@ -338,8 +340,12 @@ async function runBotLoop() {
                     }
                 }
 
-                // 4. SCANSIONE ATTIVA CON SHUFFLE CASUALE (Stop al blocco sulle prime lettere)
-                let allKrakenPairs = Object.keys(exchange.markets).filter(symbol => symbol.endsWith('/EUR') && exchange.markets[symbol].active);
+                // 4. SCANSIONE ATTIVA CON SHUFFLE CASUALE & FILTRO ANTI-STABLECOIN
+                let allKrakenPairs = Object.keys(exchange.markets).filter(symbol => {
+                    if (!symbol.endsWith('/EUR') || !exchange.markets[symbol].active) return false;
+                    const base = symbol.split('/')[0].replace(/^X/, '').replace(/^Z/, '');
+                    return !stablecoinsToIgnore.includes(base);
+                });
                 
                 // MISCHIAMO CASUALMENTE LE COPPIE DI KRAKEN PER COPRIRE TUTTO IL LISTINO
                 allKrakenPairs = shuffleArray(allKrakenPairs);
@@ -352,7 +358,9 @@ async function runBotLoop() {
                             params: { start: 1, limit: 100, sort: 'percent_change_24h', sort_dir: 'desc', convert: 'EUR' }
                         });
                         for (const coin of cmcResponse.data.data) {
-                            const sym = `${coin.symbol}/EUR`;
+                            const baseSym = coin.symbol;
+                            if (stablecoinsToIgnore.includes(baseSym)) continue;
+                            const sym = `${baseSym}/EUR`;
                             const change24h = coin.quote?.EUR?.percent_change_24h || 0;
                             if (exchange.markets[sym] && exchange.markets[sym].active && change24h > 0.8) {
                                 cmcTopMovers.push(sym);
@@ -416,39 +424,4 @@ async function runBotLoop() {
 
                         const isTopMover = cmcTopMovers.includes(symbol) || watchedOutperformers.includes(symbol);
                         let buyCondition = false;
-                        let reason = "";
-
-                        const requiredScore = isBtcBullish ? 4 : (isTopMover ? 3 : 4);
-
-                        if (!isPanicCrash && confluenceScore >= requiredScore) {
-                            buyCondition = (eurBalance >= 5);
-                            reason = `Catturato Top Mover/Range (Score: ${confluenceScore}/5 - CMC Top: ${isTopMover ? 'Sì' : 'No'})`;
-                            watchedOutperformers = watchedOutperformers.filter(s => s !== symbol);
-                        }
-
-                        if (buyCondition) {
-                            console.log(`[🚀 ACCENSIONE OPERATIVA] Trovata occasione su ${symbol} | Motivo: ${reason} | Prezzo: €${currentPrice}`);
-                            const amountToBuy = targetInvestmentSize / currentPrice;
-                            const order = await exchange.createMarketBuyOrder(symbol, amountToBuy);
-                            console.log(`[SUCCESSO ACQUISTO] Acquistati ~€${targetInvestmentSize} di ${symbol}! ID:`, order.id);
-                            lastLog = `[${now}] Acquistati €${targetInvestmentSize} di ${symbol} (${reason})`;
-                            await new Promise(resolve => setTimeout(resolve, 15000));
-                            break;
-                        }
-                    } catch (altErr) {}
-                }
-            }
-        } catch (err) {
-            console.log("Errore nel ciclo principale:", err.message);
-        }
-
-        await new Promise(resolve => setTimeout(resolve, 60000));
-    }
-}
-
-app.listen(PORT, () => {
-    console.log(`Server in ascolto sulla porta ${PORT}`);
-    setTimeout(() => {
-        runBotLoop();
-    }, 3000);
-});
+                        let reason
