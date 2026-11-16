@@ -17,7 +17,7 @@ const exchange = new ccxt.kraken({
 });
 
 let botRunning = true;
-let lastLog = "Bot avviato: Sistema Completo Unificato (Termometro + Live BTC + Fast-Cut -0.3% + TP Reale + Netto Fee).";
+let lastLog = "Bot avviato: Versione Definitiva Unificata (Tutte le funzioni attive).";
 let watchedOutperformers = [];
 global.lastBtcLivePrice = 0;
 
@@ -99,7 +99,7 @@ async function runBotLoop() {
                     const btcTicker = await exchange.fetchTicker('BTC/EUR');
                     const btcCurrentLivePrice = btcTicker.last;
                     if (global.lastBtcLivePrice && btcCurrentLivePrice < global.lastBtcLivePrice * 0.985) {
-                        console.log(`[🚨 FLASH CRASH LIVE] BTC è sceso bruscamente a €${btcCurrentLivePrice}! Protezione d'emergenza attiva.`);
+                        console.log(`[🚨 FLASH CRASH LIVE] BTC è sceso a €${btcCurrentLivePrice}! Protezione d'emergenza attiva.`);
                         isLiveFlashCrash = true;
                     }
                     global.lastBtcLivePrice = btcCurrentLivePrice;
@@ -120,11 +120,11 @@ async function runBotLoop() {
                     isBtcBullish = false;
                 }
 
-                // SOGLIE OPERATIVE DI USCITA
-                const dynamicTakeProfit = 1.2;  // TP Lordo per garantire utile netto reale dopo le fee
-                const fastCutThreshold = -0.3;  // Taglio istantaneo se il trade flette dello 0.3%
+                // SOGLIE OPERATIVE DEFINITIVE
+                const dynamicTakeProfit = 1.2;  // TP Lordo per utile netto reale
+                const fastCutThreshold = -0.3;  // Taglio immediato allo -0.3% reale per liberare la cassa
 
-                // 3. MONITORAGGIO PORTAFOGLIO, NETTO FEE & TAGLIO RAPIDO
+                // 3. MONITORAGGIO PORTAFOGLIO & GESTIONE USCITE / FAST-CUT
                 const totalBalances = balance.total || {};
                 for (const currency of Object.keys(totalBalances)) {
                     if (stablecoinsToIgnore.includes(currency)) continue;
@@ -151,18 +151,16 @@ async function runBotLoop() {
                             } catch (e) {}
 
                             const grossPnlPercent = ((currentPrice - entryPrice) / entryPrice) * 100;
-                            const estimatedFeePercent = 0.52; // 0.26% acquisto + 0.26% vendita Kraken
-                            const netPnlPercent = grossPnlPercent - estimatedFeePercent;
 
-                            console.log(`[Portafoglio] ${symbol} | Ingresso: €${entryPrice.toFixed(2)} | Attuale: €${currentPrice.toFixed(2)} | Lordo: ${grossPnlPercent.toFixed(2)}% | Netto Fee: ${netPnlPercent.toFixed(2)}%`);
+                            console.log(`[Portafoglio] ${symbol} | Ingresso: €${entryPrice.toFixed(2)} | Attuale: €${currentPrice.toFixed(2)} | PnL Reale: ${grossPnlPercent.toFixed(2)}%`);
 
                             const freeAmount = balance.free[currency] || 0;
                             if (freeAmount <= 0.0001) continue;
 
-                            // CONDIZIONI DI USCITA / ROTAZIONE RAPIDA IN EUR
-                            if (isLiveFlashCrash || grossPnlPercent >= dynamicTakeProfit || netPnlPercent >= 0.6 || grossPnlPercent <= fastCutThreshold) {
-                                const reason = isLiveFlashCrash ? "Flash Crash Live" : (grossPnlPercent <= fastCutThreshold ? "⚡ Fast-Cut (-0.3%)" : "Take-Profit Netto Raggiunto");
-                                console.log(`[🔄 ROTAZIONE] Vendita in corso su ${symbol} | Motivo: ${reason} (Lordo: ${grossPnlPercent.toFixed(2)}% | Netto: ${netPnlPercent.toFixed(2)}%)...`);
+                            // USCITA AUTOMATICA (Flash Crash, TP raggiunto o Fast-Cut immediato)
+                            if (isLiveFlashCrash || grossPnlPercent >= dynamicTakeProfit || grossPnlPercent <= fastCutThreshold) {
+                                const reason = isLiveFlashCrash ? "Flash Crash Live" : (grossPnlPercent <= fastCutThreshold ? "⚡ Fast-Cut (-0.3%)" : "Take-Profit Raggiunto");
+                                console.log(`[🔄 ROTAZIONE] Vendita in corso su ${symbol} | Motivo: ${reason} (Variazione: ${grossPnlPercent.toFixed(2)}%)...`);
                                 
                                 await exchange.createMarketSellOrder(symbol, freeAmount);
                                 await new Promise(resolve => setTimeout(resolve, 3000));
@@ -210,7 +208,7 @@ async function runBotLoop() {
                 }
 
                 let prioritizedAssets = [...new Set([...cmcTopMovers, ...allKrakenPairs])];
-                watchedOutperformers = prioritizedAssets.slice(0, 10); // Salviamo un'anteprima per la dashboard
+                watchedOutperformers = prioritizedAssets.slice(0, 10);
 
                 for (const symbol of prioritizedAssets) {
                     try {
