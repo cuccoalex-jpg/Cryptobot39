@@ -21,7 +21,7 @@ let lastLog = "Bot avviato: Shuffle Casuale + TP Rapido Laterale + Filtro Anti-S
 
 let watchedOutperformers = [];
 
-// Lista di stablecoin o asset fiat equivalenti da NON trattare come altcoin da trading
+// Lista di stablecoin o asset fiat equivalenti da ignorare completamente
 const stablecoinsToIgnore = ['USDC', 'EURC', 'USDT', 'DAI', 'PYUSD', 'ZEUR', 'KFEE'];
 
 app.get('/', (req, res) => {
@@ -43,7 +43,6 @@ app.post('/api/toggle', (req, res) => {
     res.json({ success: true, botRunning, message: lastLog });
 });
 
-// Funzione di utilità per mescolare casualmente un array (evita il blocco sulle prime lettere)
 function shuffleArray(array) {
     for (let i = array.length - 1; i > 0; i--) {
         const j = Math.floor(Math.random() * (i + 1));
@@ -51,8 +50,6 @@ function shuffleArray(array) {
     }
     return array;
 }
-
-// --- MOTORE INDICATORI TECNICI A 360° ---
 
 function calculateRSI(closes, period = 14) {
     if (!closes || closes.length < period + 1) return 50;
@@ -221,12 +218,10 @@ async function runBotLoop() {
                 const now = new Date().toLocaleString();
                 await exchange.loadMarkets();
 
-                // 1. Saldi su Kraken (Focalizzati rigorosamente su EUR)
                 const balance = await exchange.fetchBalance();
                 const eurBalance = balance.free['EUR'] || balance.free['ZEUR'] || 0;
                 console.log(`[${now}] Saldo disponibile EUR: €${eurBalance.toFixed(2)}`);
 
-                // 2. Termometro BTC & Sentiment Macro
                 const macro = await getMacroSentiment();
                 let isBtcBullish = false;
                 let isPanicCrash = false;
@@ -266,11 +261,9 @@ async function runBotLoop() {
                     isBtcBullish = false;
                 }
 
-                // Parametri dinamici: in laterale/bearish TP a 0.8% lordo (~0.3% netto pulito)
                 const dynamicStopLoss = isBtcBullish ? -5.0 : -2.0;    
                 const dynamicTakeProfit = isBtcBullish ? 1.4 : 0.8;     
 
-                // 3. MONITORAGGIO PRIORITARIO PORTAFOGLIO (Escludendo stablecoin e gestendo solo crypto reali)
                 const totalBalances = balance.total || {};
                 for (const currency of Object.keys(totalBalances)) {
                     if (stablecoinsToIgnore.includes(currency)) continue;
@@ -288,13 +281,11 @@ async function runBotLoop() {
                             const currentPrice = ticker.last;
 
                             let entryPrice = currentPrice;
-                            let foundRealTrade = false;
                             try {
                                 const trades = await exchange.fetchMyTrades(symbol, undefined, 10);
                                 const buyTrades = trades.filter(t => t.side === 'buy');
                                 if (buyTrades.length > 0) {
                                     entryPrice = buyTrades[buyTrades.length - 1].price;
-                                    foundRealTrade = true;
                                 }
                             } catch (e) {}
 
@@ -340,14 +331,12 @@ async function runBotLoop() {
                     }
                 }
 
-                // 4. SCANSIONE ATTIVA CON SHUFFLE CASUALE & FILTRO ANTI-STABLECOIN
                 let allKrakenPairs = Object.keys(exchange.markets).filter(symbol => {
                     if (!symbol.endsWith('/EUR') || !exchange.markets[symbol].active) return false;
                     const base = symbol.split('/')[0].replace(/^X/, '').replace(/^Z/, '');
                     return !stablecoinsToIgnore.includes(base);
                 });
                 
-                // MISCHIAMO CASUALMENTE LE COPPIE DI KRAKEN PER COPRIRE TUTTO IL LISTINO
                 allKrakenPairs = shuffleArray(allKrakenPairs);
 
                 let cmcTopMovers = [];
@@ -374,7 +363,6 @@ async function runBotLoop() {
                     }
                 }
 
-                // Uniamo i top movers di CMC alla lista mista casuale di Kraken
                 let prioritizedAssets = [...new Set([...watchedOutperformers, ...cmcTopMovers, ...allKrakenPairs.slice(0, 25)])];
 
                 for (const symbol of prioritizedAssets) {
@@ -424,4 +412,39 @@ async function runBotLoop() {
 
                         const isTopMover = cmcTopMovers.includes(symbol) || watchedOutperformers.includes(symbol);
                         let buyCondition = false;
-                        let reason
+                        let reason = "";
+
+                        const requiredScore = isBtcBullish ? 4 : (isTopMover ? 3 : 4);
+
+                        if (!isPanicCrash && confluenceScore >= requiredScore) {
+                            buyCondition = (eurBalance >= 5);
+                            reason = `Catturato Top Mover/Range (Score: ${confluenceScore}/5 - CMC Top: ${isTopMover ? 'Sì' : 'No'})`;
+                            watchedOutperformers = watchedOutperformers.filter(s => s !== symbol);
+                        }
+
+                        if (buyCondition) {
+                            console.log(`[🚀 ACCENSIONE OPERATIVA] Trovata occasione su ${symbol} | Motivo: ${reason} | Prezzo: €${currentPrice}`);
+                            const amountToBuy = targetInvestmentSize / currentPrice;
+                            const order = await exchange.createMarketBuyOrder(symbol, amountToBuy);
+                            console.log(`[SUCCESSO ACQUISTO] Acquistati ~€${targetInvestmentSize} di ${symbol} in EUR! ID:`, order.id);
+                            lastLog = `[${now}] Acquistati €${targetInvestmentSize} di ${symbol} (${reason})`;
+                            await new Promise(resolve => setTimeout(resolve, 15000));
+                            break;
+                        }
+                    } catch (altErr) {}
+                }
+            }
+        } catch (err) {
+            console.log("Errore nel ciclo principale:", err.message);
+        }
+
+        await new Promise(resolve => setTimeout(resolve, 60000));
+    }
+}
+
+app.listen(PORT, () => {
+    console.log(`Server in ascolto sulla porta ${PORT}`);
+    setTimeout(() => {
+        runBotLoop();
+    }, 3000);
+});
