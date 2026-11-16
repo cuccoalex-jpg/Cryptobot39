@@ -17,7 +17,7 @@ const exchange = new ccxt.kraken({
 });
 
 let botRunning = true;
-let lastLog = "Bot avviato: Cacciatore Top Movers CMC + Fast-Cut Netto (-0.7%) + TP Netto Dinamico.";
+let lastLog = "Bot avviato: Shuffle Casuale + TP Rapido Laterale + Fast-Cut Netto (-0.7%).";
 
 let watchedOutperformers = [];
 
@@ -39,6 +39,15 @@ app.post('/api/toggle', (req, res) => {
     lastLog = `Bot ${botRunning ? 'riattivato' : 'messo in pausa'} via API.`;
     res.json({ success: true, botRunning, message: lastLog });
 });
+
+// Funzione di utilità per mescolare casualmente un array (evita il blocco sulle prime lettere)
+function shuffleArray(array) {
+    for (let i = array.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [array[i], array[j]] = [array[j], array[i]];
+    }
+    return array;
+}
 
 // --- MOTORE INDICATORI TECNICI A 360° ---
 
@@ -214,7 +223,7 @@ async function runBotLoop() {
                 const eurBalance = balance.free['EUR'] || 0;
                 console.log(`[${now}] Saldo disponibile EUR: €${eurBalance.toFixed(2)}`);
 
-                // 2. Termometro BTC & Sentiment Macro (Informativo / Controllo Panic Crash)
+                // 2. Termometro BTC & Sentiment Macro
                 const macro = await getMacroSentiment();
                 let isBtcBullish = false;
                 let isPanicCrash = false;
@@ -247,15 +256,16 @@ async function runBotLoop() {
                     isBtcBullish = is4hStructureBullish && is1hStructureBullish;
                     isPanicCrash = (btcChange1h <= -4.0) || (btcChange1h <= -3.0 && macro.isExtremeFear);
 
-                    lastLog = `[${now}] 📊 Termometro BTC: €${btcPrice.toFixed(2)} | F&G: ${macro.value} | Stato: ${isPanicCrash ? '🚨 PANIC' : (isBtcBullish ? 'BULLISH' : 'BEARISH / LATERALE (Attivi Top Movers CMC)')}`;
+                    lastLog = `[${now}] 📊 Termometro BTC: €${btcPrice.toFixed(2)} | F&G: ${macro.value} | Stato: ${isPanicCrash ? '🚨 PANIC' : (isBtcBullish ? 'BULLISH' : 'BEARISH / LATERALE (TP Adattivo Rapido Attivo)')}`;
                     console.log(lastLog);
                 } catch (btcErr) {
                     console.log(`[${now}] ⚠️ Errore lettura termometro BTC:`, btcErr.message);
                     isBtcBullish = false;
                 }
 
+                // Parametri dinamici: in laterale/bearish abbassiamo il TP a 0.8% lordo (~0.3% netto pulito) per chiudere subito i micro-movimenti!
                 const dynamicStopLoss = isBtcBullish ? -5.0 : -2.0;    
-                const dynamicTakeProfit = isBtcBullish ? 1.4 : 1.0;     
+                const dynamicTakeProfit = isBtcBullish ? 1.4 : 0.8;     
 
                 // 3. MONITORAGGIO PRIORITARIO PORTAFOGLIO (Con calcolo P&L Netto e Fee ~0.5%)
                 const totalBalances = balance.total || {};
@@ -305,7 +315,7 @@ async function runBotLoop() {
                             }
 
                             if (netPnlPercent >= dynamicTakeProfit) {
-                                console.log(`[TAKE-PROFIT NETTO] Target raggiunto su ${symbol} (+${netPnlPercent.toFixed(2)}% effettivi). Vendita...`);
+                                console.log(`[TAKE-PROFIT NETTO RAPIDO] Target raggiunto su ${symbol} (+${netPnlPercent.toFixed(2)}% effettivi). Vendita immediata...`);
                                 await exchange.createMarketSellOrder(symbol, freeAmount);
                                 await new Promise(resolve => setTimeout(resolve, 5000));
                                 continue;
@@ -328,21 +338,23 @@ async function runBotLoop() {
                     }
                 }
 
-                // 4. SCANSIONE ATTIVA: COINMARKETCAP TOP MOVERS PRIMA DI TUTTO
+                // 4. SCANSIONE ATTIVA CON SHUFFLE CASUALE (Stop al blocco sulle prime lettere)
                 let allKrakenPairs = Object.keys(exchange.markets).filter(symbol => symbol.endsWith('/EUR') && exchange.markets[symbol].active);
                 
+                // MISCHIAMO CASUALMENTE LE COPPIE DI KRAKEN PER COPRIRE TUTTO IL LISTINO
+                allKrakenPairs = shuffleArray(allKrakenPairs);
+
                 let cmcTopMovers = [];
                 if (CMC_API_KEY) {
                     try {
                         const cmcResponse = await axios.get('https://pro-api.coinmarketcap.com/v1/cryptocurrency/listings/latest', {
                             headers: { 'X-CMC_PRO_API_KEY': CMC_API_KEY },
-                            params: { start: 1, limit: 80, sort: 'percent_change_24h', sort_dir: 'desc', convert: 'EUR' }
+                            params: { start: 1, limit: 100, sort: 'percent_change_24h', sort_dir: 'desc', convert: 'EUR' }
                         });
                         for (const coin of cmcResponse.data.data) {
                             const sym = `${coin.symbol}/EUR`;
                             const change24h = coin.quote?.EUR?.percent_change_24h || 0;
-                            // Se l'asset sta performando positivamente e c'è su Kraken, lo mettiamo in cima ai Top Movers!
-                            if (exchange.markets[sym] && exchange.markets[sym].active && change24h > 1.0) {
+                            if (exchange.markets[sym] && exchange.markets[sym].active && change24h > 0.8) {
                                 cmcTopMovers.push(sym);
                                 if (!watchedOutperformers.includes(sym)) {
                                     watchedOutperformers.push(sym);
@@ -354,8 +366,8 @@ async function runBotLoop() {
                     }
                 }
 
-                // Diamo priorità assoluta ai Top Movers di CMC per catturare chi sta salendo ora
-                let prioritizedAssets = [...new Set([...watchedOutperformers, ...cmcTopMovers, ...allKrakenPairs.slice(0, 20)])];
+                // Uniamo i top movers di CMC alla lista mista casuale di Kraken
+                let prioritizedAssets = [...new Set([...watchedOutperformers, ...cmcTopMovers, ...allKrakenPairs.slice(0, 25)])];
 
                 for (const symbol of prioritizedAssets) {
                     try {
@@ -406,7 +418,6 @@ async function runBotLoop() {
                         let buyCondition = false;
                         let reason = "";
 
-                        // 🚀 REGOLA SPECIALE TOP MOVERS: Anche se BTC è laterale, se un asset è tra i migliori su CMC e ha score >= 3, lo compriamo!
                         const requiredScore = isBtcBullish ? 4 : (isTopMover ? 3 : 4);
 
                         if (!isPanicCrash && confluenceScore >= requiredScore) {
