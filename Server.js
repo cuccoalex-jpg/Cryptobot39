@@ -17,7 +17,7 @@ const exchange = new ccxt.kraken({
 });
 
 let botRunning = true;
-let lastLog = "Bot avviato: Protezione Live BTC + Calcolo Netto Fee Attivo.";
+let lastLog = "Bot avviato: TP Reale Profittevole (>1.2% Lordo) + Protezione Live BTC.";
 let watchedOutperformers = [];
 global.lastBtcLivePrice = 0;
 
@@ -82,7 +82,7 @@ async function runBotLoop() {
                 const eurBalance = balance.free['EUR'] || balance.free['ZEUR'] || 0;
                 console.log(`[${now}] Saldo EUR: €${eurBalance.toFixed(2)}`);
 
-                // 1. CONTROLLO LIVE BTC
+                // 1. CONTROLLO LIVE BTC (Flash Crash Protection)
                 let isLiveFlashCrash = false;
                 try {
                     const btcTicker = await exchange.fetchTicker('BTC/EUR');
@@ -94,9 +94,10 @@ async function runBotLoop() {
                     global.lastBtcLivePrice = btcPrice;
                 } catch (e) {}
 
-                const dynamicTakeProfit = 0.5; // TP lordo
+                // SOGLIA CORRETTA: 1.2% Lordo garantisce un utile netto reale dopo ~0.52% di fee Kraken
+                const dynamicTakeProfit = 1.2; 
 
-                // 2. PORTAFOGLIO & NETTO FEE
+                // 2. PORTAFOGLIO & NETTO FEE REALE
                 const totalBalances = balance.total || {};
                 for (const currency of Object.keys(totalBalances)) {
                     if (stablecoinsToIgnore.includes(currency)) continue;
@@ -129,8 +130,9 @@ async function runBotLoop() {
                             const freeAmount = balance.free[currency] || 0;
                             if (freeAmount <= 0.0001) continue;
 
-                            if (isLiveFlashCrash || grossPnlPercent >= dynamicTakeProfit || netPnlPercent >= 0.05 || grossPnlPercent <= -0.6) {
-                                console.log(`[🔄 ROTAZIONE] Vendita ${symbol} (Lordo: ${grossPnlPercent.toFixed(2)}% | Netto: ${netPnlPercent.toFixed(2)}%)...`);
+                            // Chiusura solo se c'è un vero utile netto (> +0.6%) o se scatta il blocco d'emergenza / stop loss
+                            if (isLiveFlashCrash || grossPnlPercent >= dynamicTakeProfit || netPnlPercent >= 0.6 || grossPnlPercent <= -0.8) {
+                                console.log(`[🔄 ROTAZIONE] Vendita ${symbol} (Lordo: ${grossPnlPercent.toFixed(2)}% | Netto Reale: ${netPnlPercent.toFixed(2)}%)...`);
                                 await exchange.createMarketSellOrder(symbol, freeAmount);
                                 await new Promise(resolve => setTimeout(resolve, 5000));
                                 continue;
