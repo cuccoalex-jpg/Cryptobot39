@@ -17,8 +17,10 @@ const exchange = new ccxt.kraken({
 });
 
 let botRunning = true;
-let lastLog = "Bot avviato: Versione Definitiva Unificata (Lotti + Laterale + Live BTC + Fast-Cut -0.3% + TP Reale).";
+let lastLog = "Bot avviato: TP Ottimizzato a 0.6% Netto (1.12% Lordo) + Watchlist 37 Asset + Lotti + Fast-Cut -0.3%.";
 let watchedOutperformers = [];
+let focusedHotPool = [];
+let lastHotPoolUpdate = 0;
 global.lastBtcLivePrice = 0;
 
 // Lista di stablecoin o asset fiat equivalenti da ignorare completamente
@@ -31,7 +33,7 @@ app.get('/', (req, res) => {
             <body style="font-family: Arial; padding: 20px; background: #111; color: #fff;">
                 <h1>Cryptobot39 - Stato: ${botRunning ? 'ATTIVO & OPERATIVO' : 'FERMO'}</h1>
                 <p><b>Ultima attività:</b> ${lastLog}</p>
-                <p><b>Watchlist Rotazione / Kraken:</b> ${watchedOutperformers.length > 0 ? watchedOutperformers.join(', ') : 'Sincronizzazione in corso...'}</p>
+                <p><b>Watchlist Attiva (37 Asset Caldi):</b> ${watchedOutperformers.length > 0 ? watchedOutperformers.join(', ') : 'Sincronizzazione in corso...'}</p>
             </body>
         </html>
     `);
@@ -76,7 +78,6 @@ function calculateBollingerBands(closes, period = 20, stdDevMultiplier = 2) {
     const upper = middle + (stdDevMultiplier * stdDev);
     const lower = middle - (stdDevMultiplier * stdDev);
     
-    // Rilevamento Mercato Laterale (Bande strette / compressione di volatilità)
     const bandWidth = (upper - lower) / middle;
     const isSideways = bandWidth < 0.04;
 
@@ -109,7 +110,7 @@ async function runBotLoop() {
                 const eurBalance = balance.free['EUR'] || balance.free['ZEUR'] || 0;
                 console.log(`[${now}] Saldo disponibile EUR: €${eurBalance.toFixed(2)}`);
 
-                // 1. CONTROLLO LIVE TICKER DI BTC (Protezione Flash Crash in tempo reale)[span_0](start_span)[span_0](end_span)
+                // 1. CONTROLLO LIVE TICKER DI BTC (Protezione Flash Crash in tempo reale)
                 let isLiveFlashCrash = false;
                 try {
                     const btcTicker = await exchange.fetchTicker('BTC/EUR');
@@ -136,9 +137,9 @@ async function runBotLoop() {
                     isBtcBullish = false;
                 }
 
-                // SOGLIE OPERATIVE DEFINITIVE
-                const dynamicTakeProfit = 1.2;  // TP Lordo per utile netto reale dopo le fee
-                const fastCutThreshold = -0.3;  // Taglio immediato allo -0.3% reale per liberare la cassa[span_1](start_span)[span_1](end_span)
+                // SOGLIE OPERATIVE AGGIORNATE AL TARGET RICHIESTO (0.6% netto reale -> 1.12% lordo)
+                const dynamicTakeProfit = 1.12;  // 0.52% fee Kraken + 0.6% utile netto reale
+                const fastCutThreshold = -0.3;   // Taglio immediato allo -0.3% reale per liberare la cassa
 
                 // 3. MONITORAGGIO PORTAFOGLIO, GESTIONE LOTTI & FAST-CUT
                 const totalBalances = balance.total || {};
@@ -171,15 +172,15 @@ async function runBotLoop() {
 
                             const grossPnlPercent = ((currentPrice - entryPrice) / entryPrice) * 100;
 
-                            console.log(`[Portafoglio / Lotto] ${symbol} | Ingresso: €${entryPrice.toFixed(2)} | Attuale: €${currentPrice.toFixed(2)} | PnL: ${grossPnlPercent.toFixed(2)}%`);
+                            console.log(`[Portafoglio / Lotto] ${symbol} | Ingresso: €${entryPrice.toFixed(2)} | Attuale: €${currentPrice.toFixed(2)} | PnL Lordo: ${grossPnlPercent.toFixed(2)}% (Target Netto: +0.6%)`);
 
                             const freeAmount = balance.free[currency] || 0;
                             if (freeAmount <= 0.0001) continue;
 
-                            // USCITA AUTOMATICA (Flash Crash, TP raggiunto o Fast-Cut immediato sui lotti)[span_2](start_span)[span_2](end_span)
+                            // USCITA AUTOMATICA (Flash Crash, TP a 0.6% netto raggiunto o Fast-Cut immediato)
                             if (isLiveFlashCrash || grossPnlPercent >= dynamicTakeProfit || grossPnlPercent <= fastCutThreshold) {
-                                const reason = isLiveFlashCrash ? "Flash Crash Live" : (grossPnlPercent <= fastCutThreshold ? "⚡ Fast-Cut (-0.3% Lotto)" : "Take-Profit Raggiunto");
-                                console.log(`[🔄 ROTAZIONE LOTTO] Chiusura su ${symbol} | Motivo: ${reason} (PnL: ${grossPnlPercent.toFixed(2)}%)...`);
+                                const reason = isLiveFlashCrash ? "Flash Crash Live" : (grossPnlPercent <= fastCutThreshold ? "⚡ Fast-Cut (-0.3% Lotto)" : "🎯 Take-Profit Netto (+0.6%) Raggiunto");
+                                console.log(`[🔄 ROTAZIONE LOTTO] Chiusura su ${symbol} | Motivo: ${reason} (PnL Lordo: ${grossPnlPercent.toFixed(2)}%)...`);
                                 
                                 await exchange.createMarketSellOrder(symbol, freeAmount);
                                 await new Promise(resolve => setTimeout(resolve, 3000));
@@ -196,44 +197,47 @@ async function runBotLoop() {
                     continue;
                 }
 
-                // 4. SCANSIONE A 360° KRAKEN + CMC, MERCATO LATERALE & IPERVENDUTI IN RIMBALZO
-                let allKrakenPairs = Object.keys(exchange.markets).filter(symbol => {
-                    if (!symbol.endsWith('/EUR') || !exchange.markets[symbol].active) return false;
-                    const base = symbol.split('/')[0].replace(/^X/, '').replace(/^Z/, '');
-                    return !stablecoinsToIgnore.includes(base);
-                });
-                
-                allKrakenPairs = shuffleArray(allKrakenPairs);
+                // 4. SELEZIONE E MANTENIMENTO DEI 37 ASSET PIÙ CALDI (Aggiornata ogni 15 minuti)
+                const currentTime = Date.now();
+                if (focusedHotPool.length === 0 || (currentTime - lastHotPoolUpdate > 15 * 60 * 1000)) {
+                    console.log(`[🎯 AGGIORNAMENTO WATCHLIST] Ricerca e selezione dei 37 asset più caldi e di maggior valore...`);
+                    
+                    let allKrakenPairs = Object.keys(exchange.markets).filter(symbol => {
+                        if (!symbol.endsWith('/EUR') || !exchange.markets[symbol].active) return false;
+                        const base = symbol.split('/')[0].replace(/^X/, '').replace(/^Z/, '');
+                        return !stablecoinsToIgnore.includes(base);
+                    });
 
-                let cmcTopMovers = [];
-                if (CMC_API_KEY) {
-                    try {
-                        const cmcResponse = await axios.get('https://pro-api.coinmarketcap.com/v1/cryptocurrency/listings/latest', {
-                            headers: { 'X-CMC_PRO_API_KEY': CMC_API_KEY },
-                            params: { start: 1, limit: 300, sort: 'percent_change_24h', sort_dir: 'desc', convert: 'EUR' }
-                        });
-                        for (const coin of cmcResponse.data.data) {
-                            const baseSym = coin.symbol;
-                            if (stablecoinsToIgnore.includes(baseSym)) continue;
-                            const change24h = coin.quote?.EUR?.percent_change_24h || 0;
-                            if (change24h > 0) {
+                    let cmcTopMovers = [];
+                    if (CMC_API_KEY) {
+                        try {
+                            const cmcResponse = await axios.get('https://pro-api.coinmarketcap.com/v1/cryptocurrency/listings/latest', {
+                                headers: { 'X-CMC_PRO_API_KEY': CMC_API_KEY },
+                                params: { start: 1, limit: 100, sort: 'volume_24h', sort_dir: 'desc', convert: 'EUR' }
+                            });
+                            for (const coin of cmcResponse.data.data) {
+                                const baseSym = coin.symbol;
+                                if (stablecoinsToIgnore.includes(baseSym)) continue;
                                 const sym = `${baseSym}/EUR`;
                                 if (exchange.markets[sym] && exchange.markets[sym].active) {
                                     cmcTopMovers.push(sym);
                                 }
                             }
-                        }
-                    } catch (e) {}
+                        } catch (e) {}
+                    }
+
+                    let combinedPool = [...new Set([...cmcTopMovers, ...shuffleArray(allKrakenPairs)])];
+                    focusedHotPool = combinedPool.slice(0, 37);
+                    watchedOutperformers = focusedHotPool.slice(0, 10);
+                    lastHotPoolUpdate = currentTime;
+                    console.log(`[🎯 WATCHLIST FISSATA] Il bot sta dietro a questi 37 asset per i prossimi 15 minuti.`);
                 }
 
-                let prioritizedAssets = [...new Set([...cmcTopMovers, ...allKrakenPairs])];
-                watchedOutperformers = prioritizedAssets.slice(0, 10);
-
-                for (const symbol of prioritizedAssets) {
+                // Scansione mirata sui 37 asset caldi fissati
+                for (const symbol of focusedHotPool) {
                     try {
                         if (!exchange.markets[symbol]) continue;
                         
-                        // GESTIONE LOTTI: Evitiamo di aprire un nuovo lotto sullo stesso asset se è già presente in portafoglio
                         const baseCurrency = symbol.split('/')[0];
                         if (balance.total[baseCurrency] && balance.total[baseCurrency] > 0.0001) continue; 
 
@@ -246,7 +250,6 @@ async function runBotLoop() {
                         const bollinger = calculateBollingerBands(closes5m);
                         const { isGreenCandle } = detectChartPatterns(ohlcv5m);
 
-                        // Condizioni di ingresso: Oversold Bounce oppure Mercato Laterale in compressione con candela verde[span_3](start_span)[span_3](end_span)
                         const isOversoldRebound = (prevRsi5m <= 35 && rsi5m > prevRsi5m && isGreenCandle);
                         const isSidewaysBounce = (bollinger.isSideways && currentPrice <= bollinger.lower * 1.01 && isGreenCandle);
 
