@@ -17,7 +17,7 @@ const exchange = new ccxt.kraken({
 });
 
 let botRunning = true;
-let lastLog = "Bot avviato: Bug span_9 risolto + Portafoglio Universale + Logica Adattiva BTC + TP 0.6% Netto + Fast-Cut -0.3%.";
+let lastLog = "Bot avviato: Codice pulito al 100% (Portafoglio Universale + Logica Adattiva BTC + TP 0.6% Netto + Fast-Cut -0.3%).";
 let watchedOutperformers = [];
 let focusedHotPool = [];
 let lastHotPoolUpdate = 0;
