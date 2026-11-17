@@ -17,7 +17,7 @@ const exchange = new ccxt.kraken({
 });
 
 let botRunning = true;
-let lastLog = "Bot avviato: Codice pulito e stabile - TP 0.6% Netto + Fast-Cut -0.3% + Scansione a Lotti.";
+let lastLog = "Bot avviato: Storico esteso ordini chiusi (fino a 50) per trade manuali/fermi + TP 0.6% Netto.";
 let watchedOutperformers = [];
 let focusedHotPool = [];
 let lastHotPoolUpdate = 0;
@@ -165,12 +165,19 @@ async function runBotLoop() {
                             const ticker = await exchange.fetchTicker(symbol);
                             const currentPrice = ticker.last;
 
+                            // RICERCA STORICA PROFONDA (FINO A 50 ORDINI CHIUSI) PER TROVARE ANCHE TRADE DATATI O MANUALI
                             let entryPrice = currentPrice;
                             try {
-                                const trades = await exchange.fetchMyTrades(symbol, undefined, 10);
-                                const buyTrades = trades.filter(t => t.side === 'buy');
-                                if (buyTrades.length > 0) {
-                                    entryPrice = buyTrades[buyTrades.length - 1].price;
+                                const closedOrders = await exchange.fetchClosedOrders(symbol, undefined, 50);
+                                const buyOrders = closedOrders.filter(o => o.side === 'buy' && o.status === 'closed');
+                                if (buyOrders.length > 0) {
+                                    entryPrice = buyOrders[buyOrders.length - 1].average || buyOrders[buyOrders.length - 1].price || currentPrice;
+                                } else {
+                                    const trades = await exchange.fetchMyTrades(symbol, undefined, 50);
+                                    const buyTrades = trades.filter(t => t.side === 'buy');
+                                    if (buyTrades.length > 0) {
+                                        entryPrice = buyTrades[buyTrades.length - 1].price;
+                                    }
                                 }
                             } catch (e) {}
 
