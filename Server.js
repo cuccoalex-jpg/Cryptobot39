@@ -17,7 +17,7 @@ const exchange = new ccxt.kraken({
 });
 
 let botRunning = true;
-let lastLog = "Bot avviato: Score Tecnico Avanzato + Fast-Cut Stretto (-0.2%) + TP 0.6% Netto.";
+let lastLog = "Bot avviato: Rimbalzo su Supporto in Trend / Ipercomprato + Fast-Cut -0.2%.";
 let watchedOutperformers = [];
 let focusedHotPool = [];
 let lastHotPoolUpdate = 0;
@@ -42,7 +42,7 @@ app.post('/api/toggle', (req, res) => {
     botRunning = !botRunning;
     lastLog = `Bot ${botRunning ? 'riattivato' : 'messo in pausa'} via API.`;
     res.json({ success: true, botRunning, message: lastLog });
-});
+} );
 
 function shuffleArray(array) {
     for (let i = array.length - 1; i > 0; i--) {
@@ -82,52 +82,53 @@ function calculateBollingerBands(closes, period = 20, stdDevMultiplier = 2) {
     return { upper, middle, lower, isSideways };
 }
 
-// SISTEMA A PUNTEGGIO TECNICO AVANZATO
+// SISTEMA A PUNTEGGIO: RIMBALZO SU SUPPORTO DOPO SPINTA / IPERCOMPRATO
 function evaluateTechnicalScore(ohlcv) {
     if (!ohlcv || ohlcv.length < 20) return { score: 0, details: "Dati insufficienti" };
 
     const closes = ohlcv.map(c => c[4]);
+    const lows = ohlcv.map(c => c[3]);
     const volumes = ohlcv.map(c => c[5]);
+    
     const currentClose = closes[closes.length - 1];
     const prevClose = closes[closes.length - 2];
     
     let score = 0;
     let reasons = [];
 
-    // 1. Analisi Candela (Verde e corpo forte)
-    const isGreen = currentClose > prevClose;
-    if (isGreen) {
-        score += 2;
-        reasons.push("Candela Verde");
-    }
-
-    // 2. RSI (5m)
     const rsi = calculateRSI(closes, 14);
-    const prevRsi = calculateRSI(closes.slice(0, -1), 14);
-    if (rsi <= 38 && rsi > prevRsi) {
-        score += 3;
-        reasons.push(`Rimbalzo Oversold (RSI: ${rsi.toFixed(1)})`);
-    } else if (rsi > 45 && rsi < 65 && isGreen) {
-        score += 1.5;
-        reasons.push(`RSI Neutro/Bullish (${rsi.toFixed(1)})`);
-    }
+    const isGreen = currentClose > prevClose;
 
-    // 3. Bande di Bollinger
+    // 1. CONDIZIONE DI RIMBALZO SU SUPPORTO (Il prezzo tocca o si avvicina al minimo recente / banda centrale o inferiore e rema in verde)
+    const recentLow = Math.min(...lows.slice(-12, -1));
     const bollinger = calculateBollingerBands(closes);
-    if (currentClose <= bollinger.lower * 1.015) {
-        score += 3;
-        reasons.push("Test Supporto Bollinger Inferiore");
-    } else if (bollinger.isSideways && isGreen) {
-        score += 2;
-        reasons.push("Rimbalzo in Laterale");
+
+    if (currentClose <= recentLow * 1.012 || currentClose <= bollinger.middle * 1.008) {
+        score += 3.5;
+        reasons.push("Test / Supporto Raggiunto");
     }
 
-    // 4. Spinta Volumi rispetto alla media recente
+    // 2. CONFERMA DELLA REAZIONE (Candela verde dopo il test del supporto)
+    if (isGreen) {
+        score += 2.5;
+        reasons.push("Reazione Verde di Rimbalzo");
+    }
+
+    // 3. MOMENTUM / FORZA DI FONDO (RSI sano o in fase di scarico controllato che torna a salire)
+    if (rsi >= 45 && rsi <= 68) {
+        score += 2;
+        reasons.push(`Trend / RSI in Ripresa (${rsi.toFixed(1)})`);
+    } else if (rsi > 68 && isGreen) {
+        score += 1.5;
+        reasons.push(`Spinta Alta (RSI: ${rsi.toFixed(1)})`);
+    }
+
+    // 4. VOLUMI DI ACCUMULO SUL SUPPORTO
     const avgVolume = volumes.slice(-10, -1).reduce((a, b) => a + b, 0) / 9;
     const lastVolume = volumes[volumes.length - 1];
-    if (lastVolume > avgVolume * 1.3) {
+    if (lastVolume > avgVolume * 1.2 && isGreen) {
         score += 2;
-        reasons.push("Volumi in Crescita");
+        reasons.push("Volumi in Ingresso sul Supporto");
     }
 
     return { score, details: reasons.join(" + ") };
@@ -163,14 +164,18 @@ async function runBotLoop() {
                     const btcOpen1h = btcOhlcv1h[btcOhlcv1h.length - 1][1];
                     const btcChange1h = ((btcPrice - btcOpen1h) / btcOpen1h) * 100;
 
-                    isBtcBullish = (btcChange1h > 0.2 && !isLiveFlashCrash);
-                    console.log(`[BTC] Variazione 1h: ${btcChange1h.toFixed(2)}% | Bullish: ${isBtcBullish}`);
+                    const btcOhlcv4h = await exchange.fetchOHLCV('BTC/EUR', '4h', undefined, 10);
+                    const btcCloses4h = btcOhlcv4h.map(c => c[4]);
+                    const btcOpen4h = btcOhlcv4h[btcOhlcv4h.length - 1][1];
+                    const btcChange4h = ((btcPrice - btcOpen4h) / btcOpen4h) * 100;
+
+                    isBtcBullish = (btcChange1h > 0.2 && btcChange4h >= -0.2 && !isLiveFlashCrash);
                 } catch (btcErr) {
                     isBtcBullish = false;
                 }
 
                 const targetTakeProfitLordo = 1.12; 
-                const thresholdFastCut = -0.2; // STRETTO AL -0.2% PER TAGLIARE SUBITO I FALSI SEGNALI
+                const thresholdFastCut = -0.2; 
 
                 const totalBalances = balance.total || {};
                 const assetKeys = Object.keys(totalBalances).filter(rawCurrency => {
@@ -216,8 +221,6 @@ async function runBotLoop() {
                             } catch (e) {}
 
                             const profitPercentage = ((currentPrice - entryPrice) / entryPrice) * 100;
-                            console.log(`[Wallet] ${symbol} | Ingresso: €${entryPrice.toFixed(2)} | Attuale: €${currentPrice.toFixed(2)} | PnL: ${profitPercentage.toFixed(2)}%`);
-
                             const freeCoinAmount = balance.free[rawCurrency] || balance.free[cleanCurrency] || balance.free[`X${cleanCurrency}`] || balance.free[`Z${cleanCurrency}`] || 0;
                             if (freeCoinAmount <= 0.0001) continue;
 
@@ -234,9 +237,7 @@ async function runBotLoop() {
                                 
                                 await new Promise(resolve => setTimeout(resolve, 3000));
                             }
-                        } catch (errPort) {
-                            console.log(`Errore asset ${symbol}:`, errPort.message);
-                        }
+                        } catch (errPort) {}
                     }
                     await new Promise(resolve => setTimeout(resolve, 1500));
                 }
@@ -257,17 +258,13 @@ async function runBotLoop() {
                     let cmcTopMovers = [];
                     if (CMC_API_KEY) {
                         try {
-                            const sortParam = isBtcBullish ? 'volume_24h' : 'percent_change_24h';
                             const cmcResponse = await axios.get('https://pro-api.coinmarketcap.com/v1/cryptocurrency/listings/latest', {
                                 headers: { 'X-CMC_PRO_API_KEY': CMC_API_KEY },
-                                params: { start: 1, limit: 100, sort: sortParam, sort_dir: 'desc', convert: 'EUR' }
+                                params: { start: 1, limit: 100, sort: 'percent_change_24h', sort_dir: 'desc', convert: 'EUR' }
                             });
                             for (const coin of cmcResponse.data.data) {
                                 const baseSym = coin.symbol;
                                 if (stablecoinsToIgnore.includes(baseSym)) continue;
-                                const change24h = coin.quote?.EUR?.percent_change_24h || 0;
-                                if (!isBtcBullish && change24h <= 0) continue; 
-
                                 const sym = `${baseSym}/EUR`;
                                 if (exchange.markets[sym] && exchange.markets[sym].active) {
                                     cmcTopMovers.push(sym);
@@ -276,16 +273,7 @@ async function runBotLoop() {
                         } catch (e) {}
                     }
 
-                    if (!isBtcBullish) {
-                        focusedHotPool = cmcTopMovers.slice(0, 37);
-                        if (focusedHotPool.length < 10) {
-                            focusedHotPool = [...new Set([...cmcTopMovers, ...shuffleArray(krakenPairs)])].slice(0, 37);
-                        }
-                    } else {
-                        let combinedPool = [...new Set([...cmcTopMovers, ...shuffleArray(krakenPairs)])];
-                        focusedHotPool = combinedPool.slice(0, 37);
-                    }
-
+                    focusedHotPool = [...new Set([...cmcTopMovers, ...shuffleArray(krakenPairs)])].slice(0, 37);
                     watchedOutperformers = focusedHotPool.slice(0, 10);
                     lastHotPoolUpdate = currentTime;
                 }
@@ -306,10 +294,10 @@ async function runBotLoop() {
 
                             const ohlcv5m = await exchange.fetchOHLCV(symbol, '5m', undefined, 30);
                             
-                            // VALUTAZIONE CON SISTEMA A PUNTEGGIO TECNICO (Soglia minima di ingresso: 3.5 punti)
+                            // VALUTAZIONE RIMBALZO SU SUPPORTO (Soglia minima 4.0)
                             const techEval = evaluateTechnicalScore(ohlcv5m);
                             
-                            if (techEval.score < 3.5) continue; // Salta se il setup non è abbastanza forte
+                            if (techEval.score < 4.0) continue; 
 
                             let targetInvestmentSize = 5; 
                             if (eurBalance < targetInvestmentSize) targetInvestmentSize = eurBalance;
@@ -319,8 +307,8 @@ async function runBotLoop() {
                                 const amountToBuy = targetInvestmentSize / currentPrice;
                                 const order = await exchange.createMarketBuyOrder(symbol, amountToBuy);
                                 
-                                console.log(`[BUY SCORE ${techEval.score}] Acquistati €${targetInvestmentSize} di ${symbol} | Motivi: ${techEval.details}! ID:`, order.id);
-                                lastLog = `Acquistati €${targetInvestmentSize} di ${symbol} (Score: ${techEval.score})`;
+                                console.log(`[BUY SUPPORT BOUNCE SCORE ${techEval.score}] Acquistati €${targetInvestmentSize} di ${symbol} | Motivi: ${techEval.details}! ID:`, order.id);
+                                lastLog = `Acquistati €${targetInvestmentSize} di ${symbol} (Bounce Score: ${techEval.score})`;
                                 
                                 boughtInThisCycle = true;
                                 await new Promise(resolve => setTimeout(resolve, 5000));
