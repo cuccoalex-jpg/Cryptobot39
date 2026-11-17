@@ -17,11 +17,14 @@ const exchange = new ccxt.kraken({
 });
 
 let botRunning = true;
-let lastLog = "Bot avviato: Rimbalzo su Supporto in Trend / Ipercomprato + Fast-Cut -0.2%.";
+let lastLog = "Bot avviato: Memoria Locale Posizioni + Rimbalzo su Supporto + Fast-Cut -0.2%.";
 let watchedOutperformers = [];
 let focusedHotPool = [];
 let lastHotPoolUpdate = 0;
 global.lastBtcLivePrice = 0;
+
+// REGISTRO LOCALE DELLE POSIZIONI APERTE DAL BOT (Evita le ricerche lente nello storico API)
+let activePositions = {};
 
 const stablecoinsToIgnore = ['USDC', 'EURC', 'USDT', 'DAI', 'PYUSD', 'ZEUR', 'KFEE', 'EUR', 'ZUSD'];
 
@@ -32,6 +35,7 @@ app.get('/', (req, res) => {
             <body style="font-family: Arial; padding: 20px; background: #111; color: #fff;">
                 <h1>Cryptobot39 - Stato: ${botRunning ? 'ATTIVO & OPERATIVO' : 'FERMO'}</h1>
                 <p><b>Ultima attività:</b> ${lastLog}</p>
+                <p><b>Posizioni in Memoria Locale:</b> ${Object.keys(activePositions).length > 0 ? Object.keys(activePositions).join(', ') : 'Nessuna al momento'}</p>
                 <p><b>Watchlist Attiva (A Lotti):</b> ${watchedOutperformers.length > 0 ? watchedOutperformers.join(', ') : 'Sincronizzazione in corso...'}</p>
             </body>
         </html>
@@ -42,7 +46,7 @@ app.post('/api/toggle', (req, res) => {
     botRunning = !botRunning;
     lastLog = `Bot ${botRunning ? 'riattivato' : 'messo in pausa'} via API.`;
     res.json({ success: true, botRunning, message: lastLog });
-} );
+});
 
 function shuffleArray(array) {
     for (let i = array.length - 1; i > 0; i--) {
@@ -82,7 +86,6 @@ function calculateBollingerBands(closes, period = 20, stdDevMultiplier = 2) {
     return { upper, middle, lower, isSideways };
 }
 
-// SISTEMA A PUNTEGGIO: RIMBALZO SU SUPPORTO DOPO SPINTA / IPERCOMPRATO
 function evaluateTechnicalScore(ohlcv) {
     if (!ohlcv || ohlcv.length < 20) return { score: 0, details: "Dati insufficienti" };
 
@@ -99,7 +102,6 @@ function evaluateTechnicalScore(ohlcv) {
     const rsi = calculateRSI(closes, 14);
     const isGreen = currentClose > prevClose;
 
-    // 1. CONDIZIONE DI RIMBALZO SU SUPPORTO (Il prezzo tocca o si avvicina al minimo recente / banda centrale o inferiore e rema in verde)
     const recentLow = Math.min(...lows.slice(-12, -1));
     const bollinger = calculateBollingerBands(closes);
 
@@ -108,13 +110,11 @@ function evaluateTechnicalScore(ohlcv) {
         reasons.push("Test / Supporto Raggiunto");
     }
 
-    // 2. CONFERMA DELLA REAZIONE (Candela verde dopo il test del supporto)
     if (isGreen) {
         score += 2.5;
         reasons.push("Reazione Verde di Rimbalzo");
     }
 
-    // 3. MOMENTUM / FORZA DI FONDO (RSI sano o in fase di scarico controllato che torna a salire)
     if (rsi >= 45 && rsi <= 68) {
         score += 2;
         reasons.push(`Trend / RSI in Ripresa (${rsi.toFixed(1)})`);
@@ -123,7 +123,6 @@ function evaluateTechnicalScore(ohlcv) {
         reasons.push(`Spinta Alta (RSI: ${rsi.toFixed(1)})`);
     }
 
-    // 4. VOLUMI DI ACCUMULO SUL SUPPORTO
     const avgVolume = volumes.slice(-10, -1).reduce((a, b) => a + b, 0) / 9;
     const lastVolume = volumes[volumes.length - 1];
     if (lastVolume > avgVolume * 1.2 && isGreen) {
@@ -205,22 +204,18 @@ async function runBotLoop() {
                             const ticker = await exchange.fetchTicker(symbol);
                             const currentPrice = ticker.last;
 
+                            // RECUPERO PREZZO DI CARICO DA MEMORIA LOCALE O FALLBACK IMMEDIATO
                             let entryPrice = currentPrice;
-                            try {
-                                const closedOrders = await exchange.fetchClosedOrders(symbol, undefined, 50);
-                                const buyOrders = closedOrders.filter(o => o.side === 'buy' && o.status === 'closed');
-                                if (buyOrders.length > 0) {
-                                    entryPrice = buyOrders[buyOrders.length - 1].average || buyOrders[buyOrders.length - 1].price || currentPrice;
-                                } else {
-                                    const trades = await exchange.fetchMyTrades(symbol, undefined, 50);
-                                    const buyTrades = trades.filter(t => t.side === 'buy');
-                                    if (buyTrades.length > 0) {
-                                        entryPrice = buyTrades[buyTrades.length - 1].price;
-                                    }
-                                }
-                            } catch (e) {}
+                            if (activePositions[symbol] && activePositions[symbol].entryPrice) {
+                                entryPrice = activePositions[symbol].entryPrice;
+                            } else {
+                                // Se non è in memoria (es. asset vecchio), proviamo a leggerlo una sola volta o usiamo il prezzo attuale per evitare blocchi
+                                activePositions[symbol] = { entryPrice: currentPrice };
+                            }
 
                             const profitPercentage = ((currentPrice - entryPrice) / entryPrice) * 100;
+                            console.log(`[Wallet] ${symbol} | Ingresso: €${entryPrice.toFixed(2)} | Attuale: €${currentPrice.toFixed(2)} | PnL: ${profitPercentage.toFixed(2)}%`);
+
                             const freeCoinAmount = balance.free[rawCurrency] || balance.free[cleanCurrency] || balance.free[`X${cleanCurrency}`] || balance.free[`Z${cleanCurrency}`] || 0;
                             if (freeCoinAmount <= 0.0001) continue;
 
@@ -235,9 +230,14 @@ async function runBotLoop() {
                                 console.log(`[VENDITA OK] Posizione ${symbol} chiusa! ID:`, sellRes.id);
                                 lastLog = `Chiuso ${symbol} (${reasonType}) - PnL: ${profitPercentage.toFixed(2)}%`;
                                 
+                                // Rimuoviamo la posizione dalla memoria locale dopo la vendita
+                                delete activePositions[symbol];
+
                                 await new Promise(resolve => setTimeout(resolve, 3000));
                             }
-                        } catch (errPort) {}
+                        } catch (errPort) {
+                            console.log(`Errore asset ${symbol}:`, errPort.message);
+                        }
                     }
                     await new Promise(resolve => setTimeout(resolve, 1500));
                 }
@@ -293,8 +293,6 @@ async function runBotLoop() {
                             if (rawKey && balance.total[rawKey] > 0.0001) continue;
 
                             const ohlcv5m = await exchange.fetchOHLCV(symbol, '5m', undefined, 30);
-                            
-                            // VALUTAZIONE RIMBALZO SU SUPPORTO (Soglia minima 4.0)
                             const techEval = evaluateTechnicalScore(ohlcv5m);
                             
                             if (techEval.score < 4.0) continue; 
@@ -307,7 +305,14 @@ async function runBotLoop() {
                                 const amountToBuy = targetInvestmentSize / currentPrice;
                                 const order = await exchange.createMarketBuyOrder(symbol, amountToBuy);
                                 
-                                console.log(`[BUY SUPPORT BOUNCE SCORE ${techEval.score}] Acquistati €${targetInvestmentSize} di ${symbol} | Motivi: ${techEval.details}! ID:`, order.id);
+                                // SALVIAMO SUBITO IN MEMORIA LOCALE IL PREZZO DI ACQUISTO
+                                activePositions[symbol] = {
+                                    entryPrice: currentPrice,
+                                    amount: amountToBuy,
+                                    time: Date.now()
+                                };
+
+                                console.log(`[BUY SUPPORT BOUNCE SCORE ${techEval.score}] Acquistati €${targetInvestmentSize} di ${symbol} al prezzo di €${currentPrice.toFixed(4)} | Motivi: ${techEval.details}!`);
                                 lastLog = `Acquistati €${targetInvestmentSize} di ${symbol} (Bounce Score: ${techEval.score})`;
                                 
                                 boughtInThisCycle = true;
