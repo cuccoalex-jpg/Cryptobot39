@@ -17,7 +17,7 @@ const exchange = new ccxt.kraken({
 });
 
 let botRunning = true;
-let lastLog = "Bot avviato: Recupero Smart Storico + Rimbalzo su Supporto + Fast-Cut -0.2%.";
+let lastLog = "Bot avviato: Corretto errore sintassi + Recupero Storico + Fast-Cut -0.2%.";
 let watchedOutperformers = [];
 let focusedHotPool = [];
 let lastHotPoolUpdate = 0;
@@ -203,18 +203,16 @@ async function runBotLoop() {
                             const ticker = await exchange.fetchTicker(symbol);
                             const currentPrice = ticker.last;
 
-                            // RECUPERO PREZZO DI CARICO (Memoria locale -> Storico Kraken -> Prezzo corrente)
                             let entryPrice = currentPrice;
                             if (activePositions[symbol] && activePositions[symbol].entryPrice) {
                                 entryPrice = activePositions[symbol].entryPrice;
                             } else {
-                                // Se non è in memoria locale (es. dopo un riavvio del server), interroghiamo Kraken per quel simbolo specifico
                                 try {
                                     const myTrades = await exchange.fetchMyTrades(symbol, undefined, 10);
                                     const lastBuy = myTrades.reverse().find(t => t.side === 'buy');
                                     if (lastBuy && lastBuy.price) {
                                         entryPrice = lastBuy.price;
-                                        activePositions[symbol] = { entryPrice: entryPrice }; // Salviamo in memoria
+                                        activePositions[symbol] = { entryPrice: entryPrice };
                                     } else {
                                         activePositions[symbol] = { entryPrice: currentPrice };
                                     }
@@ -248,7 +246,6 @@ async function runBotLoop() {
                             console.log(`Errore asset ${symbol}:`, errPort.message);
                         }
                     }
-                    await new BalanceDelayOrPause(1500); // placeholder for safety
                     await new Promise(resolve => setTimeout(resolve, 1500));
                 }
 
