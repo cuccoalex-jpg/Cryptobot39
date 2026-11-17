@@ -17,7 +17,7 @@ const exchange = new ccxt.kraken({
 });
 
 let botRunning = true;
-let lastLog = "Bot avviato: Storico esteso ordini chiusi (fino a 50) per trade manuali/fermi + TP 0.6% Netto.";
+let lastLog = "Bot avviato: Score Tecnico Avanzato + Fast-Cut Stretto (-0.2%) + TP 0.6% Netto.";
 let watchedOutperformers = [];
 let focusedHotPool = [];
 let lastHotPoolUpdate = 0;
@@ -76,26 +76,61 @@ function calculateBollingerBands(closes, period = 20, stdDevMultiplier = 2) {
     const stdDev = Math.sqrt(variance);
     const upper = middle + (stdDevMultiplier * stdDev);
     const lower = middle - (stdDevMultiplier * stdDev);
-    
     const bandWidth = (upper - lower) / middle;
     const isSideways = bandWidth < 0.04;
 
     return { upper, middle, lower, isSideways };
 }
 
-function detectChartPatterns(ohlcv) {
-    if (!ohlcv || ohlcv.length < 15) return { score: 0, isGreenCandle: false };
-    const lastCandle = ohlcv[ohlcv.length - 1];
-    const isGreenCandle = lastCandle[4] > lastCandle[1];
+// SISTEMA A PUNTEGGIO TECNICO AVANZATO
+function evaluateTechnicalScore(ohlcv) {
+    if (!ohlcv || ohlcv.length < 20) return { score: 0, details: "Dati insufficienti" };
+
     const closes = ohlcv.map(c => c[4]);
-    const lows = ohlcv.map(c => c[3]);
-    let score = 0;
+    const volumes = ohlcv.map(c => c[5]);
     const currentClose = closes[closes.length - 1];
-    const recentMin = Math.min(...lows.slice(-10));
-    if (Math.abs(currentClose - recentMin) / recentMin < 0.01 && isGreenCandle) {
-        score += 3;
+    const prevClose = closes[closes.length - 2];
+    
+    let score = 0;
+    let reasons = [];
+
+    // 1. Analisi Candela (Verde e corpo forte)
+    const isGreen = currentClose > prevClose;
+    if (isGreen) {
+        score += 2;
+        reasons.push("Candela Verde");
     }
-    return { score, isGreenCandle };
+
+    // 2. RSI (5m)
+    const rsi = calculateRSI(closes, 14);
+    const prevRsi = calculateRSI(closes.slice(0, -1), 14);
+    if (rsi <= 38 && rsi > prevRsi) {
+        score += 3;
+        reasons.push(`Rimbalzo Oversold (RSI: ${rsi.toFixed(1)})`);
+    } else if (rsi > 45 && rsi < 65 && isGreen) {
+        score += 1.5;
+        reasons.push(`RSI Neutro/Bullish (${rsi.toFixed(1)})`);
+    }
+
+    // 3. Bande di Bollinger
+    const bollinger = calculateBollingerBands(closes);
+    if (currentClose <= bollinger.lower * 1.015) {
+        score += 3;
+        reasons.push("Test Supporto Bollinger Inferiore");
+    } else if (bollinger.isSideways && isGreen) {
+        score += 2;
+        reasons.push("Rimbalzo in Laterale");
+    }
+
+    // 4. Spinta Volumi rispetto alla media recente
+    const avgVolume = volumes.slice(-10, -1).reduce((a, b) => a + b, 0) / 9;
+    const lastVolume = volumes[volumes.length - 1];
+    if (lastVolume > avgVolume * 1.3) {
+        score += 2;
+        reasons.push("Volumi in Crescita");
+    }
+
+    return { score, details: reasons.join(" + ") };
 }
 
 async function runBotLoop() {
@@ -135,7 +170,7 @@ async function runBotLoop() {
                 }
 
                 const targetTakeProfitLordo = 1.12; 
-                const thresholdFastCut = -0.3;      
+                const thresholdFastCut = -0.2; // STRETTO AL -0.2% PER TAGLIARE SUBITO I FALSI SEGNALI
 
                 const totalBalances = balance.total || {};
                 const assetKeys = Object.keys(totalBalances).filter(rawCurrency => {
@@ -165,7 +200,6 @@ async function runBotLoop() {
                             const ticker = await exchange.fetchTicker(symbol);
                             const currentPrice = ticker.last;
 
-                            // RICERCA STORICA PROFONDA (FINO A 50 ORDINI CHIUSI) PER TROVARE ANCHE TRADE DATATI O MANUALI
                             let entryPrice = currentPrice;
                             try {
                                 const closedOrders = await exchange.fetchClosedOrders(symbol, undefined, 50);
@@ -182,7 +216,6 @@ async function runBotLoop() {
                             } catch (e) {}
 
                             const profitPercentage = ((currentPrice - entryPrice) / entryPrice) * 100;
-
                             console.log(`[Wallet] ${symbol} | Ingresso: €${entryPrice.toFixed(2)} | Attuale: €${currentPrice.toFixed(2)} | PnL: ${profitPercentage.toFixed(2)}%`);
 
                             const freeCoinAmount = balance.free[rawCurrency] || balance.free[cleanCurrency] || balance.free[`X${cleanCurrency}`] || balance.free[`Z${cleanCurrency}`] || 0;
@@ -192,11 +225,12 @@ async function runBotLoop() {
                             const isFastCutValid = profitPercentage <= thresholdFastCut;
 
                             if (isLiveFlashCrash || isTpValid || isFastCutValid) {
-                                console.log(`[VENDITA] Chiusura su ${symbol} (PnL: ${profitPercentage.toFixed(2)}%). Invio ordine...`);
+                                const reasonType = isLiveFlashCrash ? "FLASH CRASH" : (isTpValid ? "TAKE PROFIT" : "FAST CUT (-0.2%)");
+                                console.log(`[VENDITA] Chiusura (${reasonType}) su ${symbol} (PnL: ${profitPercentage.toFixed(2)}%). Invio ordine...`);
 
                                 const sellRes = await exchange.createMarketSellOrder(symbol, freeCoinAmount);
                                 console.log(`[VENDITA OK] Posizione ${symbol} chiusa! ID:`, sellRes.id);
-                                lastLog = `Chiuso ${symbol} - PnL: ${profitPercentage.toFixed(2)}%`;
+                                lastLog = `Chiuso ${symbol} (${reasonType}) - PnL: ${profitPercentage.toFixed(2)}%`;
                                 
                                 await new Promise(resolve => setTimeout(resolve, 3000));
                             }
@@ -271,28 +305,23 @@ async function runBotLoop() {
                             if (rawKey && balance.total[rawKey] > 0.0001) continue;
 
                             const ohlcv5m = await exchange.fetchOHLCV(symbol, '5m', undefined, 30);
-                            const closes5m = ohlcv5m.map(c => c[4]);
-                            const currentPrice = closes5m[closes5m.length - 1];
                             
-                            const rsi5m = calculateRSI(closes5m, 14);
-                            const prevRsi5m = calculateRSI(closes5m.slice(0, -1), 14);
-                            const bollinger = calculateBollingerBands(closes5m);
-                            const { isGreenCandle } = detectChartPatterns(ohlcv5m);
-
-                            const isOversoldRebound = (prevRsi5m <= 35 && rsi5m > prevRsi5m && isGreenCandle);
-                            const isSidewaysBounce = (bollinger.isSideways && currentPrice <= bollinger.lower * 1.01 && isGreenCandle);
-
-                            if (!isGreenCandle && !isOversoldRebound && !isSidewaysBounce) continue;
+                            // VALUTAZIONE CON SISTEMA A PUNTEGGIO TECNICO (Soglia minima di ingresso: 3.5 punti)
+                            const techEval = evaluateTechnicalScore(ohlcv5m);
+                            
+                            if (techEval.score < 3.5) continue; // Salta se il setup non è abbastanza forte
 
                             let targetInvestmentSize = 5; 
                             if (eurBalance < targetInvestmentSize) targetInvestmentSize = eurBalance;
 
                             if (eurBalance >= 5) {
-                                const reason = isOversoldRebound ? "Oversold Bounce" : (isSidewaysBounce ? "Supporto Bollinger" : "Candela Verde");
+                                const currentPrice = ohlcv5m[ohlcv5m.length - 1][4];
                                 const amountToBuy = targetInvestmentSize / currentPrice;
                                 const order = await exchange.createMarketBuyOrder(symbol, amountToBuy);
-                                console.log(`[BUY] Acquistati €${targetInvestmentSize} di ${symbol} (${reason})! ID:`, order.id);
-                                lastLog = `Acquistati €${targetInvestmentSize} di ${symbol}`;
+                                
+                                console.log(`[BUY SCORE ${techEval.score}] Acquistati €${targetInvestmentSize} di ${symbol} | Motivi: ${techEval.details}! ID:`, order.id);
+                                lastLog = `Acquistati €${targetInvestmentSize} di ${symbol} (Score: ${techEval.score})`;
+                                
                                 boughtInThisCycle = true;
                                 await new Promise(resolve => setTimeout(resolve, 5000));
                                 break;
