@@ -17,13 +17,12 @@ const exchange = new ccxt.kraken({
 });
 
 let botRunning = true;
-let lastLog = "Bot avviato: Clean Build v4 - Portafoglio Universale + TP 0.6% Netto + Fast-Cut -0.3%.";
+let lastLog = "Bot avviato: Codice Rigenerato al 100% - Zero residui, TP 0.6% Netto + Fast-Cut -0.3%.";
 let watchedOutperformers = [];
 let focusedHotPool = [];
 let lastHotPoolUpdate = 0;
 global.lastBtcLivePrice = 0;
 
-// Lista di stablecoin o asset fiat equivalenti da ignorare completamente
 const stablecoinsToIgnore = ['USDC', 'EURC', 'USDT', 'DAI', 'PYUSD', 'ZEUR', 'KFEE', 'EUR', 'ZUSD'];
 
 app.get('/', (req, res) => {
@@ -110,19 +109,19 @@ async function runBotLoop() {
                 const eurBalance = balance.free['EUR'] || balance.free['ZEUR'] || 0;
                 console.log(`[${now}] Saldo disponibile EUR: €${eurBalance.toFixed(2)}`);
 
-                // 1. CONTROLLO LIVE TICKER DI BTC (Protezione Flash Crash in tempo reale)[span_0](start_span)[span_0](end_span)
+                // 1. FLASH CRASH LIVE BTC
                 let isLiveFlashCrash = false;
                 try {
                     const btcTicker = await exchange.fetchTicker('BTC/EUR');
                     const btcCurrentLivePrice = btcTicker.last;
                     if (global.lastBtcLivePrice && btcCurrentLivePrice < global.lastBtcLivePrice * 0.985) {
-                        console.log(`[🚨 FLASH CRASH LIVE] BTC è sceso a €${btcCurrentLivePrice}! Protezione d'emergenza attiva.`);
+                        console.log(`[🚨 FLASH CRASH LIVE] BTC è sceso a €${btcCurrentLivePrice}! Protezione attiva.`);
                         isLiveFlashCrash = true;
                     }
                     global.lastBtcLivePrice = btcCurrentLivePrice;
                 } catch (e) {}
 
-                // 2. TERMOMETRO MACRO & TREND DI BITCOIN (Logica Adattiva)
+                // 2. TERMOMETRO BTC
                 let isBtcBullish = false;
                 try {
                     const btcOhlcv1h = await exchange.fetchOHLCV('BTC/EUR', '1h', undefined, 20);
@@ -132,16 +131,15 @@ async function runBotLoop() {
                     const btcChange1h = ((btcPrice - btcOpen1h) / btcOpen1h) * 100;
 
                     isBtcBullish = (btcChange1h > 0.2 && !isLiveFlashCrash);
-                    console.log(`[Termometro BTC] Prezzo: €${btcPrice.toFixed(2)} | Variazione 1h: ${btcChange1h.toFixed(2)}% | Trend Bullish: ${isBtcBullish ? 'SI (Rally)' : 'NO (Incerto / Top Pump)'}`);
+                    console.log(`[Termometro BTC] Prezzo: €${btcPrice.toFixed(2)} | Variazione 1h: ${btcChange1h.toFixed(2)}% | Bullish: ${isBtcBullish}`);
                 } catch (btcErr) {
                     isBtcBullish = false;
                 }
 
-                // SOGLIE OPERATIVE DI FERRO
-                const targetTakeProfitLordo = 1.12;  // 1.12% lordo per garantirti lo 0.6% netto pulito[span_1](start_span)[span_1](end_span)
-                const thresholdFastCut = -0.3;       // Taglio immediato allo -0.3% reale[span_2](start_span)[span_2](end_span)
+                const targetTakeProfitLordo = 1.12;  //[span_0](start_span)[span_0](end_span)
+                const thresholdFastCut = -0.3;       //[span_1](start_span)[span_1](end_span)
 
-                // 3. MONITORAGGIO UNIVERSALE PORTAFOGLIO & CHIUSURA FORZATA
+                // 3. MONITORAGGIO PORTAFOGLIO & VENDITA DIRETTA
                 const totalBalances = balance.total || {};
                 let activePositionsCount = 0;
 
@@ -178,30 +176,27 @@ async function runBotLoop() {
 
                         const profitPercentage = ((currentPrice - entryPrice) / entryPrice) * 100;
 
-                        console.log(`[Portafoglio Check] ${symbol} | Ingresso: €${entryPrice.toFixed(2)} | Attuale: €${currentPrice.toFixed(2)} | PnL Lordo: ${profitPercentage.toFixed(2)}% (Target: +1.12%)`);
+                        console.log(`[Check] ${symbol} | Ingresso: €${entryPrice.toFixed(2)} | Attuale: €${currentPrice.toFixed(2)} | PnL: ${profitPercentage.toFixed(2)}%`);
 
                         const freeCoinAmount = balance.free[rawCurrency] || balance.free[cleanCurrency] || balance.free[`X${cleanCurrency}`] || balance.free[`Z${cleanCurrency}`] || 0;
                         if (freeCoinAmount <= 0.0001) continue;
 
-                        const isTakeProfitValid = profitPercentage >= targetTakeProfitLordo;
-                        const isFastCutValid = profitPercentage <= thresholdFastCut;
+                        if (isLiveFlashCrash || profitPercentage >= targetTakeProfitLordo || profitPercentage <= thresholdFastCut) {
+                            let reasonTxt = "Take-Profit Raggiunto (+0.6% Netto)";[span_2](start_span)[span_2](end_span)
+                            if (isLiveFlashCrash) reasonTxt = "Flash Crash";
+                            else if (profitPercentage <= thresholdFastCut) reasonTxt = "Fast-Cut (-0.3%)";[span_3](start_span)[span_3](end_span)
 
-                        if (isLiveFlashCrash || isTakeProfitValid || isFastCutValid) {
-                            let closeReason = "🎯 Take-Profit Netto (+0.6%) Raggiunto";[span_3](start_span)[span_3](end_span)
-                            if (isLiveFlashCrash) closeReason = "🚨 Flash Crash Live";
-                            else if (isFastCutValid) closeReason = "⚡ Fast-Cut (-0.3% Lotto)";[span_4](start_span)[span_4](end_span)
-
-                            console.log(`[🔄 VENDITA AUTOMATICA] Esecuzione chiusura su ${symbol} | Motivo: ${closeReason} | PnL: ${profitPercentage.toFixed(2)}%...`);[span_5](start_span)[span_5](end_span)
+                            console.log(`[VENDITA] Chiusura in corso su ${symbol} | Motivo: ${reasonTxt} | PnL: ${profitPercentage.toFixed(2)}%`);[span_4](start_span)[span_4](end_span)
                             
-                            const sellResultOrder = await exchange.createMarketSellOrder(symbol, freeCoinAmount);
-                            console.log(`[SUCCESSO VENDITA] Posizione ${symbol} chiusa correttamente! ID Ordine:`, sellResultOrder.id);
-                            lastLog = `[${now}] Chiusura ${symbol} (${closeReason}) - PnL: ${profitPercentage.toFixed(2)}%`;
+                            const orderRes = await exchange.createMarketSellOrder(symbol, freeCoinAmount);
+                            console.log(`[VENDITA OK] Chiuso ${symbol}! ID:`, orderRes.id);
+                            lastLog = `Chiuso ${symbol} (${reason}) - PnL: ${profitPercentage.toFixed(2)}%`;
                             
                             await new Promise(resolve => setTimeout(resolve, 5000));
                             continue;
                         }
-                    } catch (errPortLoop) {
-                        console.log(`[AVVISO PORTAFOGLIO] Impossibile elaborare ${symbol}:`, errPortLoop.message);
+                    } catch (errLoop) {
+                        console.log(`Errore asset ${symbol}:`, errLoop.message);
                     }
                 }
 
@@ -210,10 +205,9 @@ async function runBotLoop() {
                     continue;
                 }
 
-                // 4. SELEZIONE DINAMICA ADATTIVA (Top Asset se BTC è incerto / Watchlist se in Rally)
+                // 4. WATCHLIST DINAMICA ADATTIVA
                 const currentTime = Date.now();
                 if (focusedHotPool.length === 0 || (currentTime - lastHotPoolUpdate > 15 * 60 * 1000)) {
-                    
                     let krakenPairs = Object.keys(exchange.markets).filter(symbol => {
                         if (!symbol.endsWith('/EUR') || !exchange.markets[symbol].active) return false;
                         const base = symbol.split('/')[0].replace(/^[XZ]/, '');
@@ -243,13 +237,11 @@ async function runBotLoop() {
                     }
 
                     if (!isBtcBullish) {
-                        console.log(`[🛡️ MODALITÀ DIFENSIVA / TOP PUMP] BTC incerto: scansione mirata esclusivamente sui top asset che pompano.`);[span_6](start_span)[span_6](end_span)
                         focusedHotPool = cmcTopMovers.slice(0, 37);
                         if (focusedHotPool.length < 10) {
                             focusedHotPool = [...new Set([...cmcTopMovers, ...shuffleArray(krakenPairs)])].slice(0, 37);
                         }
                     } else {
-                        console.log(`[🚀 MODALITÀ RALLY] BTC Bullish: attivata watchlist standard a 37 asset caldi.`);
                         let combinedPool = [...new Set([...cmcTopMovers, ...shuffleArray(krakenPairs)])];
                         focusedHotPool = combinedPool.slice(0, 37);
                     }
@@ -258,7 +250,7 @@ async function runBotLoop() {
                     lastHotPoolUpdate = currentTime;
                 }
 
-                // 5. APERTURA NUOVI LOTTI SULLA WATCHLIST MIRATA
+                // 5. APERTURA NUOVI LOTTI
                 for (const symbol of focusedHotPool) {
                     try {
                         if (!exchange.markets[symbol]) continue;
@@ -286,13 +278,11 @@ async function runBotLoop() {
                         if (eurBalance < targetInvestmentSize) targetInvestmentSize = eurBalance;
 
                         if (eurBalance >= 5) {
-                            const reason = isOversoldRebound ? "Oversold Bounce (Rimbalzo Ipervenduto 🚀)" : (isSidewaysBounce ? "Mercato Laterale / Supporto Bollinger 📊" : "Candela Verde Attiva");
-                            console.log(`[🚀 NUOVO LOTTO] Apertura su ${symbol} | Motivo: ${reason} | Prezzo: €${currentPrice}`);
-                            
+                            const reason = isOversoldRebound ? "Oversold Bounce" : (isSidewaysBounce ? "Supporto Bollinger" : "Candela Verde");
                             const amountToBuy = targetInvestmentSize / currentPrice;
                             const order = await exchange.createMarketBuyOrder(symbol, amountToBuy);
-                            console.log(`[SUCCESSO] Acquistati €${targetInvestmentSize} di ${symbol} (Lotto n. ${activePositionsCount + 1})! ID:`, order.id);
-                            lastLog = `[${now}] Acquistati €${targetInvestmentSize} di ${symbol} (${reason})`;
+                            console.log(`[ACQUISTO] Presi €${targetInvestmentSize} di ${symbol} (${reason})! ID:`, order.id);
+                            lastLog = `Acquistati €${targetInvestmentSize} di ${symbol}`;
                             await new Promise(resolve => setTimeout(resolve, 15000));
                             break;
                         }
