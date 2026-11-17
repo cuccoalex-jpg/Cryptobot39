@@ -17,13 +17,12 @@ const exchange = new ccxt.kraken({
 });
 
 let botRunning = true;
-let lastLog = "Bot avviato: Memoria Locale Posizioni + Rimbalzo su Supporto + Fast-Cut -0.2%.";
+let lastLog = "Bot avviato: Recupero Smart Storico + Rimbalzo su Supporto + Fast-Cut -0.2%.";
 let watchedOutperformers = [];
 let focusedHotPool = [];
 let lastHotPoolUpdate = 0;
 global.lastBtcLivePrice = 0;
 
-// REGISTRO LOCALE DELLE POSIZIONI APERTE DAL BOT (Evita le ricerche lente nello storico API)
 let activePositions = {};
 
 const stablecoinsToIgnore = ['USDC', 'EURC', 'USDT', 'DAI', 'PYUSD', 'ZEUR', 'KFEE', 'EUR', 'ZUSD'];
@@ -35,7 +34,7 @@ app.get('/', (req, res) => {
             <body style="font-family: Arial; padding: 20px; background: #111; color: #fff;">
                 <h1>Cryptobot39 - Stato: ${botRunning ? 'ATTIVO & OPERATIVO' : 'FERMO'}</h1>
                 <p><b>Ultima attività:</b> ${lastLog}</p>
-                <p><b>Posizioni in Memoria Locale:</b> ${Object.keys(activePositions).length > 0 ? Object.keys(activePositions).join(', ') : 'Nessuna al momento'}</p>
+                <p><b>Posizioni in Memoria Locale:</b> ${Object.keys(activePositions).length > 0 ? Object.keys(activePositions).join(', ') : 'Nessuna (verranno lette da Kraken)'}</p>
                 <p><b>Watchlist Attiva (A Lotti):</b> ${watchedOutperformers.length > 0 ? watchedOutperformers.join(', ') : 'Sincronizzazione in corso...'}</p>
             </body>
         </html>
@@ -204,17 +203,28 @@ async function runBotLoop() {
                             const ticker = await exchange.fetchTicker(symbol);
                             const currentPrice = ticker.last;
 
-                            // RECUPERO PREZZO DI CARICO DA MEMORIA LOCALE O FALLBACK IMMEDIATO
+                            // RECUPERO PREZZO DI CARICO (Memoria locale -> Storico Kraken -> Prezzo corrente)
                             let entryPrice = currentPrice;
                             if (activePositions[symbol] && activePositions[symbol].entryPrice) {
                                 entryPrice = activePositions[symbol].entryPrice;
                             } else {
-                                // Se non è in memoria (es. asset vecchio), proviamo a leggerlo una sola volta o usiamo il prezzo attuale per evitare blocchi
-                                activePositions[symbol] = { entryPrice: currentPrice };
+                                // Se non è in memoria locale (es. dopo un riavvio del server), interroghiamo Kraken per quel simbolo specifico
+                                try {
+                                    const myTrades = await exchange.fetchMyTrades(symbol, undefined, 10);
+                                    const lastBuy = myTrades.reverse().find(t => t.side === 'buy');
+                                    if (lastBuy && lastBuy.price) {
+                                        entryPrice = lastBuy.price;
+                                        activePositions[symbol] = { entryPrice: entryPrice }; // Salviamo in memoria
+                                    } else {
+                                        activePositions[symbol] = { entryPrice: currentPrice };
+                                    }
+                                } catch (e) {
+                                    activePositions[symbol] = { entryPrice: currentPrice };
+                                }
                             }
 
                             const profitPercentage = ((currentPrice - entryPrice) / entryPrice) * 100;
-                            console.log(`[Wallet] ${symbol} | Ingresso: €${entryPrice.toFixed(2)} | Attuale: €${currentPrice.toFixed(2)} | PnL: ${profitPercentage.toFixed(2)}%`);
+                            console.log(`[Wallet] ${symbol} | Ingresso: €${entryPrice.toFixed(4)} | Attuale: €${currentPrice.toFixed(4)} | PnL: ${profitPercentage.toFixed(2)}%`);
 
                             const freeCoinAmount = balance.free[rawCurrency] || balance.free[cleanCurrency] || balance.free[`X${cleanCurrency}`] || balance.free[`Z${cleanCurrency}`] || 0;
                             if (freeCoinAmount <= 0.0001) continue;
@@ -230,7 +240,6 @@ async function runBotLoop() {
                                 console.log(`[VENDITA OK] Posizione ${symbol} chiusa! ID:`, sellRes.id);
                                 lastLog = `Chiuso ${symbol} (${reasonType}) - PnL: ${profitPercentage.toFixed(2)}%`;
                                 
-                                // Rimuoviamo la posizione dalla memoria locale dopo la vendita
                                 delete activePositions[symbol];
 
                                 await new Promise(resolve => setTimeout(resolve, 3000));
@@ -239,6 +248,7 @@ async function runBotLoop() {
                             console.log(`Errore asset ${symbol}:`, errPort.message);
                         }
                     }
+                    await new BalanceDelayOrPause(1500); // placeholder for safety
                     await new Promise(resolve => setTimeout(resolve, 1500));
                 }
 
@@ -305,7 +315,6 @@ async function runBotLoop() {
                                 const amountToBuy = targetInvestmentSize / currentPrice;
                                 const order = await exchange.createMarketBuyOrder(symbol, amountToBuy);
                                 
-                                // SALVIAMO SUBITO IN MEMORIA LOCALE IL PREZZO DI ACQUISTO
                                 activePositions[symbol] = {
                                     entryPrice: currentPrice,
                                     amount: amountToBuy,
