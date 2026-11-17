@@ -17,7 +17,7 @@ const exchange = new ccxt.kraken({
 });
 
 let botRunning = true;
-let lastLog = "Bot avviato: TP Ottimizzato a 0.6% Netto (1.12% Lordo) + Watchlist 37 Asset + Lotti + Fast-Cut -0.3%.";
+let lastLog = "Bot avviato: Modalità Adattiva (Top Gainers esclusivi su BTC incerto) + TP 0.6% Netto + Fast-Cut -0.3%.";
 let watchedOutperformers = [];
 let focusedHotPool = [];
 let lastHotPoolUpdate = 0;
@@ -33,7 +33,7 @@ app.get('/', (req, res) => {
             <body style="font-family: Arial; padding: 20px; background: #111; color: #fff;">
                 <h1>Cryptobot39 - Stato: ${botRunning ? 'ATTIVO & OPERATIVO' : 'FERMO'}</h1>
                 <p><b>Ultima attività:</b> ${lastLog}</p>
-                <p><b>Watchlist Attiva (37 Asset Caldi):</b> ${watchedOutperformers.length > 0 ? watchedOutperformers.join(', ') : 'Sincronizzazione in corso...'}</p>
+                <p><b>Watchlist Attiva (Top Asset / Caldi):</b> ${watchedOutperformers.length > 0 ? watchedOutperformers.join(', ') : 'Sincronizzazione in corso...'}</p>
             </body>
         </html>
     `);
@@ -110,7 +110,7 @@ async function runBotLoop() {
                 const eurBalance = balance.free['EUR'] || balance.free['ZEUR'] || 0;
                 console.log(`[${now}] Saldo disponibile EUR: €${eurBalance.toFixed(2)}`);
 
-                // 1. CONTROLLO LIVE TICKER DI BTC (Protezione Flash Crash in tempo reale)
+                // 1. CONTROLLO LIVE TICKER DI BTC (Protezione Flash Crash in tempo reale)[span_0](start_span)[span_0](end_span)
                 let isLiveFlashCrash = false;
                 try {
                     const btcTicker = await exchange.fetchTicker('BTC/EUR');
@@ -122,7 +122,7 @@ async function runBotLoop() {
                     global.lastBtcLivePrice = btcCurrentLivePrice;
                 } catch (e) {}
 
-                // 2. TERMOMETRO MACRO & TREND DI BITCOIN
+                // 2. TERMOMETRO MACRO & TREND DI BITCOIN (Rileva se è in rally o incerto/flat)
                 let isBtcBullish = false;
                 try {
                     const btcOhlcv1h = await exchange.fetchOHLCV('BTC/EUR', '1h', undefined, 20);
@@ -131,15 +131,16 @@ async function runBotLoop() {
                     const btcOpen1h = btcOhlcv1h[btcOhlcv1h.length - 1][1];
                     const btcChange1h = ((btcPrice - btcOpen1h) / btcOpen1h) * 100;
 
-                    isBtcBullish = (btcChange1h > -0.5 && !isLiveFlashCrash);
-                    console.log(`[Termometro BTC] Prezzo: €${btcPrice.toFixed(2)} | Variazione 1h: ${btcChange1h.toFixed(2)}% | Trend Bullish: ${isBtcBullish ? 'SI' : 'NO'}`);
+                    // Consideriamo BTC bullish solo se fa almeno +0.2% nell'ora; altrimenti è incerto/flat e stringiamo sui top gainers
+                    isBtcBullish = (btcChange1h > 0.2 && !isLiveFlashCrash);
+                    console.log(`[Termometro BTC] Prezzo: €${btcPrice.toFixed(2)} | Variazione 1h: ${btcChange1h.toFixed(2)}% | Trend Bullish: ${isBtcBullish ? 'SI (Rally)' : 'NO (Incerto / Focalizzazione sui Top Pump)'}`);
                 } catch (btcErr) {
                     isBtcBullish = false;
                 }
 
-                // SOGLIE OPERATIVE AGGIORNATE AL TARGET RICHIESTO (0.6% netto reale -> 1.12% lordo)
-                const dynamicTakeProfit = 1.12;  // 0.52% fee Kraken + 0.6% utile netto reale
-                const fastCutThreshold = -0.3;   // Taglio immediato allo -0.3% reale per liberare la cassa
+                // SOGLIE OPERATIVE
+                const dynamicTakeProfit = 1.12;  // 1.12% lordo per ottenere 0.6% netto pulito
+                const fastCutThreshold = -0.3;   // Taglio immediato allo -0.3% reale[span_1](start_span)[span_1](end_span)
 
                 // 3. MONITORAGGIO PORTAFOGLIO, GESTIONE LOTTI & FAST-CUT
                 const totalBalances = balance.total || {};
@@ -177,7 +178,7 @@ async function runBotLoop() {
                             const freeAmount = balance.free[currency] || 0;
                             if (freeAmount <= 0.0001) continue;
 
-                            // USCITA AUTOMATICA (Flash Crash, TP a 0.6% netto raggiunto o Fast-Cut immediato)
+                            // USCITA AUTOMATICA (Flash Crash, TP raggiunto o Fast-Cut)[span_2](start_span)[span_2](end_span)
                             if (isLiveFlashCrash || grossPnlPercent >= dynamicTakeProfit || grossPnlPercent <= fastCutThreshold) {
                                 const reason = isLiveFlashCrash ? "Flash Crash Live" : (grossPnlPercent <= fastCutThreshold ? "⚡ Fast-Cut (-0.3% Lotto)" : "🎯 Take-Profit Netto (+0.6%) Raggiunto");
                                 console.log(`[🔄 ROTAZIONE LOTTO] Chiusura su ${symbol} | Motivo: ${reason} (PnL Lordo: ${grossPnlPercent.toFixed(2)}%)...`);
@@ -197,12 +198,11 @@ async function runBotLoop() {
                     continue;
                 }
 
-                // 4. SELEZIONE E MANTENIMENTO DEI 37 ASSET PIÙ CALDI (Aggiornata ogni 15 minuti)
+                // 4. SELEZIONE INTELLIGENTE DINAMICA IN BASE A BTC
                 const currentTime = Date.now();
                 if (focusedHotPool.length === 0 || (currentTime - lastHotPoolUpdate > 15 * 60 * 1000)) {
-                    console.log(`[🎯 AGGIORNAMENTO WATCHLIST] Ricerca e selezione dei 37 asset più caldi e di maggior valore...`);
                     
-                    let allKrakenPairs = Object.keys(exchange.markets).filter(symbol => {
+                    let krakenPairs = Object.keys(exchange.markets).filter(symbol => {
                         if (!symbol.endsWith('/EUR') || !exchange.markets[symbol].active) return false;
                         const base = symbol.split('/')[0].replace(/^X/, '').replace(/^Z/, '');
                         return !stablecoinsToIgnore.includes(base);
@@ -211,13 +211,19 @@ async function runBotLoop() {
                     let cmcTopMovers = [];
                     if (CMC_API_KEY) {
                         try {
+                            // Se BTC NON è bullish (è incerto o flat), peschiamo rigorosamente i top gainers percentuali del momento che stanno pompando
+                            const sortParam = isBtcBullish ? 'volume_24h' : 'percent_change_24h';
                             const cmcResponse = await axios.get('https://pro-api.coinmarketcap.com/v1/cryptocurrency/listings/latest', {
                                 headers: { 'X-CMC_PRO_API_KEY': CMC_API_KEY },
-                                params: { start: 1, limit: 100, sort: 'volume_24h', sort_dir: 'desc', convert: 'EUR' }
+                                params: { start: 1, limit: 100, sort: sortParam, sort_dir: 'desc', convert: 'EUR' }
                             });
                             for (const coin of cmcResponse.data.data) {
                                 const baseSym = coin.symbol;
                                 if (stablecoinsToIgnore.includes(baseSym)) continue;
+                                const change24h = coin.quote?.EUR?.percent_change_24h || 0;
+                                // Se BTC è incerto, prendiamo solo monete con variazioni positive giornaliere reali
+                                if (!isBtcBullish && change24h <= 0) continue; 
+
                                 const sym = `${baseSym}/EUR`;
                                 if (exchange.markets[sym] && exchange.markets[sym].active) {
                                     cmcTopMovers.push(sym);
@@ -226,14 +232,24 @@ async function runBotLoop() {
                         } catch (e) {}
                     }
 
-                    let combinedPool = [...new Set([...cmcTopMovers, ...shuffleArray(allKrakenPairs)])];
-                    focusedHotPool = combinedPool.slice(0, 37);
+                    if (!isBtcBullish) {
+                        console.log(`[🛡️ MODALITÀ DIFENSIVA / TOP PUMP] BTC incerto: il bot seleziona esclusivamente i top asset di giornata che stanno pompando.`);
+                        focusedHotPool = cmcTopMovers.slice(0, 37);
+                        if (focusedHotPool.length < 10) {
+                            // Fallback se CMC ha pochi dati
+                            focusedHotPool = [...new Set([...cmcTopMovers, ...shuffleArray(krakenPairs)])].slice(0, 37);
+                        }
+                    } else {
+                        console.log(`[🚀 MODALITÀ RALLY] BTC Bullish: attivata watchlist standard a 37 asset caldi.`);
+                        let combinedPool = [...new Set([...cmcTopMovers, ...shuffleArray(krakenPairs)])];
+                        focusedHotPool = combinedPool.slice(0, 37);
+                    }
+
                     watchedOutperformers = focusedHotPool.slice(0, 10);
                     lastHotPoolUpdate = currentTime;
-                    console.log(`[🎯 WATCHLIST FISSATA] Il bot sta dietro a questi 37 asset per i prossimi 15 minuti.`);
                 }
 
-                // Scansione mirata sui 37 asset caldi fissati
+                // Scansione mirata sulla watchlist attiva
                 for (const symbol of focusedHotPool) {
                     try {
                         if (!exchange.markets[symbol]) continue;
