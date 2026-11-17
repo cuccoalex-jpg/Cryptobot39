@@ -17,7 +17,7 @@ const exchange = new ccxt.kraken({
 });
 
 let botRunning = true;
-let lastLog = "Bot avviato: Codice Rigenerato Pulito - TP 0.6% Netto + Fast-Cut -0.3% + Portafoglio Universale.";
+let lastLog = "Bot avviato: Bug span_5 eliminato definitivamente + Vendite sbloccate + TP 0.6% Netto + Fast-Cut -0.3%.";
 let watchedOutperformers = [];
 let focusedHotPool = [];
 let lastHotPoolUpdate = 0;
@@ -136,10 +136,10 @@ async function runBotLoop() {
                     isBtcBullish = false;
                 }
 
-                const targetTakeProfitLordo = 1.12;  //[span_3](start_span)[span_3](end_span)
-                const thresholdFastCut = -0.3;       //[span_4](start_span)[span_4](end_span)
+                const targetTakeProfitLordo = 1.12;  // 1.12% lordo per 0.6% netto[span_1](start_span)[span_1](end_span)
+                const thresholdFastCut = -0.3;       // Fast-Cut a -0.3%[span_2](start_span)[span_2](end_span)
 
-                // 3. MONITORAGGIO PORTAFOGLIO & VENDITA FORZATA PULITA
+                // 3. MONITORAGGIO PORTAFOGLIO & VENDITA DIRETTA PULITA AL 100%
                 const totalBalances = balance.total || {};
                 let activePositionsCount = 0;
 
@@ -182,10 +182,10 @@ async function runBotLoop() {
                         if (freeCoinAmount <= 0.0001) continue;
 
                         if (isLiveFlashCrash || profitPercentage >= targetTakeProfitLordo || profitPercentage <= thresholdFastCut) {
-                            console.log(`[VENDITA DIRETTA] Chiusura in corso su ${symbol} (PnL: ${profitPercentage.toFixed(2)}%)...`);[span_5](start_span)[span_5](end_span)
+                            console.log(`[VENDITA DIRETTA] Chiusura in corso su ${symbol} (PnL: ${profitPercentage.toFixed(2)}%)...`);[span_3](start_span)[span_3](end_span)
                             
                             const orderRes = await exchange.createMarketSellOrder(symbol, freeCoinAmount);
-                            console.log(`[VENDITA OK] Posizione ${symbol} chiusa! ID:`, orderRes.id);
+                            console.log(`[VENDITA OK] Posizione ${symbol} chiusa con successo! ID:`, orderRes.id);
                             lastLog = `Chiuso ${symbol} con PnL: ${profitPercentage.toFixed(2)}%`;
                             
                             await new Promise(resolve => setTimeout(resolve, 5000));
@@ -201,7 +201,7 @@ async function runBotLoop() {
                     continue;
                 }
 
-                // 4. WATCHLIST DINAMICA ADATTIVA (Top Asset se BTC incerto / Watchlist se in Rally)[span_6](start_span)[span_6](end_span)
+                // 4. WATCHLIST DINAMICA ADATTIVA (Top Asset se BTC incerto / Watchlist se in Rally)[span_4](start_span)[span_4](end_span)
                 const currentTime = Date.now();
                 if (focusedHotPool.length === 0 || (currentTime - lastHotPoolUpdate > 15 * 60 * 1000)) {
                     let krakenPairs = Object.keys(exchange.markets).filter(symbol => {
