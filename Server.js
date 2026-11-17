@@ -17,7 +17,7 @@ const exchange = new ccxt.kraken({
 });
 
 let botRunning = true;
-let lastLog = "Bot avviato: Codice Completo 100% (Portafoglio Universale + Logica Adattiva BTC + TP 0.6% Netto + Fast-Cut -0.3%).";
+let lastLog = "Bot avviato: Bug span_9 risolto + Portafoglio Universale + Logica Adattiva BTC + TP 0.6% Netto + Fast-Cut -0.3%.";
 let watchedOutperformers = [];
 let focusedHotPool = [];
 let lastHotPoolUpdate = 0;
@@ -110,7 +110,7 @@ async function runBotLoop() {
                 const eurBalance = balance.free['EUR'] || balance.free['ZEUR'] || 0;
                 console.log(`[${now}] Saldo disponibile EUR: €${eurBalance.toFixed(2)}`);
 
-                // 1. CONTROLLO LIVE TICKER DI BTC (Protezione Flash Crash in tempo reale)[span_6](start_span)[span_6](end_span)
+                // 1. CONTROLLO LIVE TICKER DI BTC (Protezione Flash Crash in tempo reale)[span_0](start_span)[span_0](end_span)
                 let isLiveFlashCrash = false;
                 try {
                     const btcTicker = await exchange.fetchTicker('BTC/EUR');
@@ -122,7 +122,7 @@ async function runBotLoop() {
                     global.lastBtcLivePrice = btcCurrentLivePrice;
                 } catch (e) {}
 
-                // 2. TERMOMETRO MACRO & TREND DI BITCOIN (Rileva se è in rally o incerto)
+                // 2. TERMOMETRO MACRO & TREND DI BITCOIN
                 let isBtcBullish = false;
                 try {
                     const btcOhlcv1h = await exchange.fetchOHLCV('BTC/EUR', '1h', undefined, 20);
@@ -138,10 +138,10 @@ async function runBotLoop() {
                 }
 
                 // SOGLIE OPERATIVE DEFINITIVE
-                const dynamicTakeProfit = 1.12;  // 1.12% lordo per ottenere 0.6% netto pulito[span_7](start_span)[span_7](end_span)
-                const fastCutThreshold = -0.3;   // Taglio immediato allo -0.3% reale[span_8](start_span)[span_8](end_span)
+                const dynamicTakeProfit = 1.12;  // 1.12% lordo per ottenere 0.6% netto pulito[span_1](start_span)[span_1](end_span)
+                const fastCutThreshold = -0.3;   // Taglio immediato allo -0.3% reale[span_2](start_span)[span_2](end_span)
 
-                // 3. MONITORAGGIO UNIVERSALE PORTAFOGLIO (Nessun asset escluso)
+                // 3. MONITORAGGIO UNIVERSALE PORTAFOGLIO
                 const totalBalances = balance.total || {};
                 let activePositionsCount = 0;
 
@@ -178,15 +178,15 @@ async function runBotLoop() {
 
                         const grossPnlPercent = ((currentPrice - entryPrice) / entryPrice) * 100;
 
-                        console.log(`[Portafoglio Universale] ${symbol} | Ingresso: €${entryPrice.toFixed(2)} | Attuale: €${currentPrice.toFixed(2)} | PnL Lordo: ${grossPnlPercent.toFixed(2)}% (Target Netto: +0.6%)`);[span_9](start_span)[span_9](end_span)
+                        console.log(`[Portafoglio Universale] ${symbol} | Ingresso: €${entryPrice.toFixed(2)} | Attuale: €${currentPrice.toFixed(2)} | PnL Lordo: ${grossPnlPercent.toFixed(2)}%`);
 
                         const freeAmount = balance.free[rawCurrency] || balance.free[cleanCurrency] || 0;
                         if (freeAmount <= 0.0001) continue;
 
-                        // USCITA AUTOMATICA (Flash Crash, TP raggiunto o Fast-Cut)[span_10](start_span)[span_10](end_span)
+                        // USCITA AUTOMATICA (Flash Crash, TP raggiunto o Fast-Cut)[span_3](start_span)[span_3](end_span)
                         if (isLiveFlashCrash || grossPnlPercent >= dynamicTakeProfit || grossPnlPercent <= fastCutThreshold) {
-                            const reason = isLiveFlashCrash ? "Flash Crash Live" : (grossPnlPercent <= fastCutThreshold ? "⚡ Fast-Cut (-0.3% Lotto)" : "🎯 Take-Profit Netto (+0.6%) Raggiunto");[span_11](start_span)[span_11](end_span)
-                            console.log(`[🔄 ROTAZIONE LOTTO] Chiusura su ${symbol} | Motivo: ${reason} (PnL Lordo: ${grossPnlPercent.toFixed(2)}%)...`);[span_12](start_span)[span_12](end_span)
+                            const reason = isLiveFlashCrash ? "Flash Crash Live" : (grossPnlPercent <= fastCutThreshold ? "⚡ Fast-Cut (-0.3% Lotto)" : "🎯 Take-Profit Netto (+0.6%) Raggiunto");[span_4](start_span)[span_4](end_span)
+                            console.log(`[🔄 ROTAZIONE LOTTO] Chiusura su ${symbol} | Motivo: ${reason} (PnL Lordo: ${grossPnlPercent.toFixed(2)}%)...`);[span_5](start_span)[span_5](end_span)
                             
                             await exchange.createMarketSellOrder(symbol, freeAmount);
                             await new Promise(resolve => setTimeout(resolve, 3000));
