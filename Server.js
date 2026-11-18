@@ -17,7 +17,7 @@ const exchange = new ccxt.kraken({
 });
 
 let botRunning = true;
-let lastLog = "Bot avviato: Corretto errore sintassi + Recupero Storico + Fast-Cut -0.2%.";
+let lastLog = "Bot avviato: Volumi Multi-Timeframe (4h/24h) + Anti-Stagnazione + Fast-Cut.";
 let watchedOutperformers = [];
 let focusedHotPool = [];
 let lastHotPoolUpdate = 0;
@@ -34,7 +34,7 @@ app.get('/', (req, res) => {
             <body style="font-family: Arial; padding: 20px; background: #111; color: #fff;">
                 <h1>Cryptobot39 - Stato: ${botRunning ? 'ATTIVO & OPERATIVO' : 'FERMO'}</h1>
                 <p><b>Ultima attività:</b> ${lastLog}</p>
-                <p><b>Posizioni in Memoria Locale:</b> ${Object.keys(activePositions).length > 0 ? Object.keys(activePositions).join(', ') : 'Nessuna (verranno lette da Kraken)'}</p>
+                <p><b>Posizioni in Memoria Locale:</b> ${Object.keys(activePositions).length > 0 ? Object.keys(activePositions).join(', ') : 'Nessuna'}</p>
                 <p><b>Watchlist Attiva (A Lotti):</b> ${watchedOutperformers.length > 0 ? watchedOutperformers.join(', ') : 'Sincronizzazione in corso...'}</p>
             </body>
         </html>
@@ -85,6 +85,7 @@ function calculateBollingerBands(closes, period = 20, stdDevMultiplier = 2) {
     return { upper, middle, lower, isSideways };
 }
 
+// VALUTAZIONE TECNICA SUL 5M
 function evaluateTechnicalScore(ohlcv) {
     if (!ohlcv || ohlcv.length < 20) return { score: 0, details: "Dati insufficienti" };
 
@@ -94,42 +95,82 @@ function evaluateTechnicalScore(ohlcv) {
     
     const currentClose = closes[closes.length - 1];
     const prevClose = closes[closes.length - 2];
+    const prevPrevClose = closes[closes.length - 3];
     
     let score = 0;
     let reasons = [];
 
     const rsi = calculateRSI(closes, 14);
     const isGreen = currentClose > prevClose;
+    const isPrevGreen = prevClose > prevPrevClose;
 
     const recentLow = Math.min(...lows.slice(-12, -1));
     const bollinger = calculateBollingerBands(closes);
 
     if (currentClose <= recentLow * 1.012 || currentClose <= bollinger.middle * 1.008) {
-        score += 3.5;
+        score += 3.0;
         reasons.push("Test / Supporto Raggiunto");
     }
 
-    if (isGreen) {
+    if (isGreen && isPrevGreen) {
         score += 2.5;
-        reasons.push("Reazione Verde di Rimbalzo");
+        reasons.push("Spinta Continua (2+ Candele)");
+    } else if (isGreen) {
+        score += 1.0;
+        reasons.push("Reazione Verde");
     }
 
     if (rsi >= 45 && rsi <= 68) {
-        score += 2;
-        reasons.push(`Trend / RSI in Ripresa (${rsi.toFixed(1)})`);
+        score += 2.0;
+        reasons.push(`RSI in Ripresa (${rsi.toFixed(1)})`);
     } else if (rsi > 68 && isGreen) {
-        score += 1.5;
-        reasons.push(`Spinta Alta (RSI: ${rsi.toFixed(1)})`);
+        score += 1.0;
+        reasons.push(`RSI Alto (${rsi.toFixed(1)})`);
     }
 
     const avgVolume = volumes.slice(-10, -1).reduce((a, b) => a + b, 0) / 9;
     const lastVolume = volumes[volumes.length - 1];
-    if (lastVolume > avgVolume * 1.2 && isGreen) {
-        score += 2;
-        reasons.push("Volumi in Ingresso sul Supporto");
+    if (lastVolume > avgVolume * 1.4 && isGreen) {
+        score += 2.0;
+        reasons.push("Volumi 5m Forti");
     }
 
     return { score, details: reasons.join(" + ") };
+}
+
+// FILTRO AGGIUNTIVO MULTI-TIMEFRAME (4h e 24h)
+async function checkHigherTimeframeVolumes(symbol) {
+    try {
+        // Controllo candele 4h (ultime 6 candele = 24h di storico 4h)
+        const ohlcv4h = await exchange.fetchOHLCV(symbol, '4h', undefined, 10);
+        if (ohlcv4h && ohlcv4h.length >= 6) {
+            const volumes4h = ohlcv4h.map(c => c[5]);
+            const closes4h = ohlcv4h.map(c => c[4]);
+            
+            const last4hVolume = volumes4h[volumes4h.length - 1];
+            const avg4hVolume = volumes4h.slice(-6, -1).reduce((a, b) => a + b, 0) / 5;
+            
+            const is4hGreen = closes4h[closes4h.length - 1] > closes4h[closes4h.length - 2];
+
+            // Se il volume 4h è superiore alla media e la candela 4h è verde, c'è conferma solida
+            if (last4hVolume >= avg4hVolume * 1.15 && is4hGreen) {
+                return true;
+            }
+        }
+
+        // Controllo candela 1d / 24h (se 4h non basta o come riscontro)
+        const ohlcv1d = await exchange.fetchOHLCV(symbol, '1d', undefined, 5);
+        if (ohlcv1d && ohlcv1d.length >= 3) {
+            const closes1d = ohlcv1d.map(c => c[4]);
+            const is1dGreen = closes1d[closes1d.length - 1] > closes1d[closes1d.length - 2];
+            if (is1dGreen) return true;
+        }
+
+        return false;
+    } catch (e) {
+        // In caso di errore di fetch sui TF superiori, non blocchiamo l'operazione ma diamo via libera neutro
+        return true;
+    }
 }
 
 async function runBotLoop() {
@@ -154,24 +195,6 @@ async function runBotLoop() {
                     global.lastBtcLivePrice = btcCurrentLivePrice;
                 } catch (e) {}
 
-                let isBtcBullish = false;
-                try {
-                    const btcOhlcv1h = await exchange.fetchOHLCV('BTC/EUR', '1h', undefined, 20);
-                    const btcCloses1h = btcOhlcv1h.map(c => c[4]);
-                    const btcPrice = btcCloses1h[btcCloses1h.length - 1];
-                    const btcOpen1h = btcOhlcv1h[btcOhlcv1h.length - 1][1];
-                    const btcChange1h = ((btcPrice - btcOpen1h) / btcOpen1h) * 100;
-
-                    const btcOhlcv4h = await exchange.fetchOHLCV('BTC/EUR', '4h', undefined, 10);
-                    const btcCloses4h = btcOhlcv4h.map(c => c[4]);
-                    const btcOpen4h = btcOhlcv4h[btcOhlcv4h.length - 1][1];
-                    const btcChange4h = ((btcPrice - btcOpen4h) / btcOpen4h) * 100;
-
-                    isBtcBullish = (btcChange1h > 0.2 && btcChange4h >= -0.2 && !isLiveFlashCrash);
-                } catch (btcErr) {
-                    isBtcBullish = false;
-                }
-
                 const targetTakeProfitLordo = 1.12; 
                 const thresholdFastCut = -0.2; 
 
@@ -185,6 +208,7 @@ async function runBotLoop() {
                     return !stablecoinsToIgnore.includes(clean);
                 });
 
+                // GESTIONE PORTAFOGLIO (TP, Fast-Cut e Time-Stop a 4 ore)
                 const portfolioBatchSize = 3;
                 for (let i = 0; i < assetKeys.length; i += portfolioBatchSize) {
                     const batch = assetKeys.slice(i, i + portfolioBatchSize);
@@ -204,25 +228,34 @@ async function runBotLoop() {
                             const currentPrice = ticker.last;
 
                             let entryPrice = currentPrice;
+                            let entryTime = Date.now();
+
                             if (activePositions[symbol] && activePositions[symbol].entryPrice) {
                                 entryPrice = activePositions[symbol].entryPrice;
+                                if (activePositions[symbol].time) {
+                                    entryTime = activePositions[symbol].time;
+                                }
                             } else {
                                 try {
                                     const myTrades = await exchange.fetchMyTrades(symbol, undefined, 10);
                                     const lastBuy = myTrades.reverse().find(t => t.side === 'buy');
                                     if (lastBuy && lastBuy.price) {
                                         entryPrice = lastBuy.price;
-                                        activePositions[symbol] = { entryPrice: entryPrice };
+                                        entryTime = lastBuy.timestamp || Date.now();
+                                        activePositions[symbol] = { entryPrice: entryPrice, time: entryTime };
                                     } else {
-                                        activePositions[symbol] = { entryPrice: currentPrice };
+                                        activePositions[symbol] = { entryPrice: currentPrice, time: Date.now() };
                                     }
                                 } catch (e) {
-                                    activePositions[symbol] = { entryPrice: currentPrice };
+                                    activePositions[symbol] = { entryPrice: currentPrice, time: Date.now() };
                                 }
                             }
 
                             const profitPercentage = ((currentPrice - entryPrice) / entryPrice) * 100;
-                            console.log(`[Wallet] ${symbol} | Ingresso: €${entryPrice.toFixed(4)} | Attuale: €${currentPrice.toFixed(4)} | PnL: ${profitPercentage.toFixed(2)}%`);
+                            const hoursOpen = (Date.now() - entryTime) / (1000 * 60 * 60);
+                            const isStagnant = (hoursOpen > 4 && profitPercentage > -0.18 && profitPercentage < 0.4);
+
+                            console.log(`[Wallet] ${symbol} | Ingresso: €${entryPrice.toFixed(4)} | Attuale: €${currentPrice.toFixed(4)} | PnL: ${profitPercentage.toFixed(2)}% | Ore: ${hoursOpen.toFixed(1)}h`);
 
                             const freeCoinAmount = balance.free[rawCurrency] || balance.free[cleanCurrency] || balance.free[`X${cleanCurrency}`] || balance.free[`Z${cleanCurrency}`] || 0;
                             if (freeCoinAmount <= 0.0001) continue;
@@ -230,8 +263,8 @@ async function runBotLoop() {
                             const isTpValid = profitPercentage >= targetTakeProfitLordo;
                             const isFastCutValid = profitPercentage <= thresholdFastCut;
 
-                            if (isLiveFlashCrash || isTpValid || isFastCutValid) {
-                                const reasonType = isLiveFlashCrash ? "FLASH CRASH" : (isTpValid ? "TAKE PROFIT" : "FAST CUT (-0.2%)");
+                            if (isLiveFlashCrash || isTpValid || isFastCutValid || isStagnant) {
+                                const reasonType = isLiveFlashCrash ? "FLASH CRASH" : (isTpValid ? "TAKE PROFIT" : (isFastCutValid ? "FAST CUT (-0.2%)" : "TIME-STOP / STAGNAZIONE"));
                                 console.log(`[VENDITA] Chiusura (${reasonType}) su ${symbol} (PnL: ${profitPercentage.toFixed(2)}%). Invio ordine...`);
 
                                 const sellRes = await exchange.createMarketSellOrder(symbol, freeCoinAmount);
@@ -254,6 +287,7 @@ async function runBotLoop() {
                     continue;
                 }
 
+                // AGGIORNAMENTO HOT POOL
                 const currentTime = Date.now();
                 if (focusedHotPool.length === 0 || (currentTime - lastHotPoolUpdate > 15 * 60 * 1000)) {
                     let krakenPairs = Object.keys(exchange.markets).filter(symbol => {
@@ -285,6 +319,7 @@ async function runBotLoop() {
                     lastHotPoolUpdate = currentTime;
                 }
 
+                // SCANSIONE WATCHLIST CON FILTRO 5M + CONFERMA VOLUMI 4H/24H
                 const watchlistBatchSize = 5;
                 for (let i = 0; i < focusedHotPool.length; i += watchlistBatchSize) {
                     const batchSymbols = focusedHotPool.slice(i, i + watchlistBatchSize);
@@ -299,10 +334,18 @@ async function runBotLoop() {
                             const rawKey = Object.keys(balance.total).find(k => k.includes(baseCurrency));
                             if (rawKey && balance.total[rawKey] > 0.0001) continue;
 
+                            // 1. Analisi preliminare su timeframe 5m
                             const ohlcv5m = await exchange.fetchOHLCV(symbol, '5m', undefined, 30);
                             const techEval = evaluateTechnicalScore(ohlcv5m);
                             
-                            if (techEval.score < 4.0) continue; 
+                            if (techEval.score < 4.5) continue; 
+
+                            // 2. Conferma di volume e trend sui timeframe superiori (4h / 24h)
+                            const isVolumeConfirmed = await checkHigherTimeframeVolumes(symbol);
+                            if (!isVolumeConfirmed) {
+                                console.log(`[Salta] ${symbol} ha superato il 5m ma manca la conferma di volume sui TF superiori (4h/24h).`);
+                                continue;
+                            }
 
                             let targetInvestmentSize = 5; 
                             if (eurBalance < targetInvestmentSize) targetInvestmentSize = eurBalance;
@@ -318,8 +361,8 @@ async function runBotLoop() {
                                     time: Date.now()
                                 };
 
-                                console.log(`[BUY SUPPORT BOUNCE SCORE ${techEval.score}] Acquistati €${targetInvestmentSize} di ${symbol} al prezzo di €${currentPrice.toFixed(4)} | Motivi: ${techEval.details}!`);
-                                lastLog = `Acquistati €${targetInvestmentSize} di ${symbol} (Bounce Score: ${techEval.score})`;
+                                console.log(`[BUY CONFERMATO 4H/24H - Score ${techEval.score}] Acquistati €${targetInvestmentSize} di ${symbol} a €${currentPrice.toFixed(4)} | Motivi: ${techEval.details}`);
+                                lastLog = `Acquistati €${targetInvestmentSize} di ${symbol} (Score: ${techEval.score})`;
                                 
                                 boughtInThisCycle = true;
                                 await new Promise(resolve => setTimeout(resolve, 5000));
