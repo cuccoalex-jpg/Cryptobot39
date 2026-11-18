@@ -17,8 +17,7 @@ const exchange = new ccxt.kraken({
 });
 
 let botRunning = true;
-let lastLog = "Bot avviato: Termometro BTC Severo + Top Movers (10€) + Anti-Stagnazione.";
-let watchedOutperformers = [];
+let lastLog = "Bot avviato: Termometro BTC (1h/4h/24h) + Stop Loss 3% + Watchlist (10€).";
 let focusedHotPool = [];
 let lastHotPoolUpdate = 0;
 global.lastBtcLivePrice = 0;
@@ -26,6 +25,13 @@ global.lastBtcLivePrice = 0;
 let activePositions = {};
 
 const stablecoinsToIgnore = ['USDC', 'EURC', 'USDT', 'DAI', 'PYUSD', 'ZEUR', 'KFEE', 'EUR', 'ZUSD'];
+
+const customWatchlistSymbols = [
+    'ETH/EUR', 'HYPE/EUR', 'ICP/EUR', 'LDO/EUR', 'ONDO/EUR', 
+    'PEPE/EUR', 'SKY/EUR', 'SOL/EUR', 'SUI/EUR', 'USUAL/EUR', 
+    'WLD/EUR', 'AAVE/EUR', 'ALLO/EUR', 'BTC/EUR', 'CRV/EUR', 
+    'EIGEN/EUR', 'ENA/EUR'
+];
 
 app.get('/', (req, res) => {
     res.send(`
@@ -35,7 +41,7 @@ app.get('/', (req, res) => {
                 <h1>Cryptobot39 - Stato: ${botRunning ? 'ATTIVO & OPERATIVO' : 'FERMO'}</h1>
                 <p><b>Ultima attività:</b> ${lastLog}</p>
                 <p><b>Posizioni in Memoria Locale:</b> ${Object.keys(activePositions).length > 0 ? Object.keys(activePositions).join(', ') : 'Nessuna'}</p>
-                <p><b>Top Movers Monitorati (Focus 10€):</b> ${focusedHotPool.length > 0 ? focusedHotPool.join(', ') : 'Sincronizzazione in corso...'}</p>
+                <p><b>Watchlist Personalizzata Attiva:</b> ${focusedHotPool.length > 0 ? focusedHotPool.join(', ') : 'Sincronizzazione in corso...'}</p>
             </body>
         </html>
     `);
@@ -63,6 +69,17 @@ function calculateRSI(closes, period = 14) {
     return 100 - (100 / (1 + rs));
 }
 
+function calculateBollingerBands(closes, period = 20, stdDevMultiplier = 2) {
+    if (!closes || closes.length < period) return { upper: 0, middle: 0, lower: 0 };
+    const slice = closes.slice(-period);
+    const middle = slice.reduce((a, b) => a + b, 0) / period;
+    const variance = slice.reduce((sum, val) => sum + Math.pow(val - middle, 2), 0) / period;
+    const stdDev = Math.sqrt(variance);
+    const upper = middle + (stdDevMultiplier * stdDev);
+    const lower = middle - (stdDevMultiplier * stdDev);
+    return { upper, middle, lower };
+}
+
 function evaluateTechnicalScore(ohlcv) {
     if (!ohlcv || ohlcv.length < 20) return { score: 0, details: "Dati insufficienti" };
 
@@ -79,22 +96,29 @@ function evaluateTechnicalScore(ohlcv) {
     const rsi = calculateRSI(closes, 14);
     const isGreen = currentClose > prevClose;
 
-    const recentLow = Math.min(...lows.slice(-8, -1));
-    if (currentClose <= recentLow * 1.015 || isGreen) {
-        score += 3.0;
-        reasons.push("Spinta / Reazione su Top Mover");
+    const recentLow = Math.min(...lows.slice(-10, -1));
+    const bollinger = calculateBollingerBands(closes);
+
+    if (currentClose <= recentLow * 1.015 || currentClose <= bollinger.lower * 1.01) {
+        score += 3.5;
+        reasons.push("Test Supporto / Bollinger Inferiore");
     }
 
-    if (rsi >= 45 && rsi <= 75) {
+    if (isGreen) {
         score += 2.5;
-        reasons.push(`RSI Dinamico (${rsi.toFixed(1)})`);
+        reasons.push("Reazione Verde");
+    }
+
+    if (rsi >= 40 && rsi <= 70) {
+        score += 2.0;
+        reasons.push(`RSI Ottimale (${rsi.toFixed(1)})`);
     }
 
     const avgVolume = volumes.slice(-8, -1).reduce((a, b) => a + b, 0) / 7;
     const lastVolume = volumes[volumes.length - 1];
-    if (lastVolume > avgVolume * 1.2 && isGreen) {
-        score += 2.5;
-        reasons.push("Volumi in Continuazione");
+    if (lastVolume > avgVolume * 1.2) {
+        score += 2.0;
+        reasons.push("Volumi Confermati");
     }
 
     return { score, details: reasons.join(" + ") };
@@ -111,19 +135,18 @@ async function runBotLoop() {
                 const eurBalance = balance.free['EUR'] || balance.free['ZEUR'] || 0;
                 console.log(`[${now}] Saldo EUR: €${eurBalance.toFixed(2)}`);
 
-                // 1. PROTEZIONE FLASH CRASH LIVE
+                // 1. TERMOMETRO BTC COMPLETO (1h, 4h e 24h) + FLASH CRASH
                 let isLiveFlashCrash = false;
                 try {
                     const btcTicker = await exchange.fetchTicker('BTC/EUR');
                     const btcCurrentLivePrice = btcTicker.last;
                     if (global.lastBtcLivePrice && btcCurrentLivePrice < global.lastBtcLivePrice * 0.985) {
-                        console.log(`[FLASH CRASH] BTC a €${btcCurrentLivePrice}! Protezione attiva.`);
+                        console.log(`[FLASH CRASH] BTC a €${btcCurrentLivePrice}! Protezione d'emergenza.`);
                         isLiveFlashCrash = true;
                     }
                     global.lastBtcLivePrice = btcCurrentLivePrice;
                 } catch (e) {}
 
-                // 2. TERMOMETRO BTC SEVERO (1h e 4h)
                 let isBtcBullish = false;
                 try {
                     const btcOhlcv1h = await exchange.fetchOHLCV('BTC/EUR', '1h', undefined, 20);
@@ -137,15 +160,20 @@ async function runBotLoop() {
                     const btcOpen4h = btcOhlcv4h[btcOhlcv4h.length - 1][1];
                     const btcChange4h = ((btcPrice - btcOpen4h) / btcOpen4h) * 100;
 
-                    // Il termometro richiede Bitcoin in salute su entrambi i timeframe
-                    isBtcBullish = (btcChange1h > 0.1 && btcChange4h >= -0.1 && !isLiveFlashCrash);
-                    console.log(`[Termometro BTC] 1h: ${btcChange1h.toFixed(2)}% | 4h: ${btcChange4h.toFixed(2)}% | Stato Bullish: ${isBtcBullish}`);
+                    const btcOhlcv1d = await exchange.fetchOHLCV('BTC/EUR', '1d', undefined, 5);
+                    const btcCloses1d = btcOhlcv1d.map(c => c[4]);
+                    const btcOpen1d = btcOhlcv1d[btcOhlcv1d.length - 1][1];
+                    const btcChange24h = ((btcPrice - btcOpen1d) / btcOpen1d) * 100;
+
+                    // Il termometro richiede Bitcoin sano su 1h, 4h e 24h (senza crolli sul giornaliero)
+                    isBtcBullish = (btcChange1h > 0.0 && btcChange4h >= -0.2 && btcChange24h >= -1.5 && !isLiveFlashCrash);
+                    console.log(`[Termometro BTC] 1h: ${btcChange1h.toFixed(2)}% | 4h: ${btcChange4h.toFixed(2)}% | 24h: ${btcChange24h.toFixed(2)}% | Bullish: ${isBtcBullish}`);
                 } catch (btcErr) {
-                    isBtcBullish = false;
+                    isBtcBullish = true;
                 }
 
                 const targetTakeProfitLordo = 1.12; 
-                const thresholdFastCut = -0.2; 
+                const thresholdStopLoss = -3.0; // Stop Loss dinamico al 3%
 
                 const totalBalances = balance.total || {};
                 const assetKeys = Object.keys(totalBalances).filter(rawCurrency => {
@@ -157,7 +185,7 @@ async function runBotLoop() {
                     return !stablecoinsToIgnore.includes(clean);
                 });
 
-                // 3. GESTIONE PORTAFOGLIO (TP, Fast-Cut e Time-Stop a 2.5 ore)
+                // 2. GESTIONE PORTAFOGLIO (TP, Stop Loss 3% e Time-Stop a 2.5 ore)
                 for (const rawCurrency of assetKeys) {
                     let cleanCurrency = rawCurrency.replace(/^[XZ]/, '');
                     if (cleanCurrency === 'XBT') cleanCurrency = 'BTC';
@@ -196,18 +224,18 @@ async function runBotLoop() {
 
                         const profitPercentage = ((currentPrice - entryPrice) / entryPrice) * 100;
                         const hoursOpen = (Date.now() - entryTime) / (1000 * 60 * 60);
-                        const isStagnant = (hoursOpen > 2.5 && profitPercentage > -0.15 && profitPercentage < 0.3);
+
+                        const isStagnant = (hoursOpen > 2.5 && profitPercentage > -0.5 && profitPercentage < 0.3);
+                        const isStopLossHit = (profitPercentage <= thresholdStopLoss || isLiveFlashCrash);
+                        const isTpValid = profitPercentage >= targetTakeProfitLordo;
 
                         console.log(`[Wallet] ${symbol} | Ingresso: €${entryPrice.toFixed(4)} | Attuale: €${currentPrice.toFixed(4)} | PnL: ${profitPercentage.toFixed(2)}% | Ore: ${hoursOpen.toFixed(1)}h`);
 
                         const freeCoinAmount = balance.free[rawCurrency] || balance.free[cleanCurrency] || balance.free[`X${cleanCurrency}`] || balance.free[`Z${cleanCurrency}`] || 0;
                         if (freeCoinAmount <= 0.0001) continue;
 
-                        const isTpValid = profitPercentage >= targetTakeProfitLordo;
-                        const isFastCutValid = profitPercentage <= thresholdFastCut;
-
-                        if (isLiveFlashCrash || isTpValid || isFastCutValid || isStagnant) {
-                            const reasonType = isLiveFlashCrash ? "FLASH CRASH" : (isTpValid ? "TAKE PROFIT" : (isFastCutValid ? "FAST CUT (-0.2%)" : "TIME-STOP RAPIDO"));
+                        if (isTpValid || isStopLossHit || isStagnant) {
+                            const reasonType = isTpValid ? "TAKE PROFIT (+1.12%)" : (isStopLossHit ? "STOP LOSS (-3%)" : "TAGLIO STAGNAZIONE (2.5h)");
                             console.log(`[VENDITA] Chiusura (${reasonType}) su ${symbol} (PnL: ${profitPercentage.toFixed(2)}%). Invio ordine...`);
 
                             const sellRes = await exchange.createMarketSellOrder(symbol, freeCoinAmount);
@@ -222,49 +250,46 @@ async function runBotLoop() {
                     }
                 }
 
-                // Se il termometro BTC è spento o c'è flash crash, saltiamo gli acquisti di nuove altcoin
-                if (!isBtcBullish || isLiveFlashCrash) {
-                    console.log(`[Attesa] Termometro BTC non favorevole o Flash Crash in corso. Nuovi acquisti sospesi.`);
-                    await new Promise(resolve => setTimeout(resolve, 30000));
-                    continue;
-                }
-
-                // 4. SELEZIONE RISTRETTA DEI TOP 5 MOVERS DI GIORNATA
+                // 3. SINCRONIZZAZIONE WATCHLIST + COINMARKETCAP
                 const currentTime = Date.now();
                 if (focusedHotPool.length === 0 || (currentTime - lastHotPoolUpdate > 10 * 60 * 1000)) {
-                    let topMoversList = [];
+                    let validatedWatchlist = [];
+                    for (const sym of customWatchlistSymbols) {
+                        if (exchange.markets[sym] && exchange.markets[sym].active) {
+                            validatedWatchlist.push(sym);
+                        }
+                    }
+
                     if (CMC_API_KEY) {
                         try {
                             const cmcResponse = await axios.get('https://pro-api.coinmarketcap.com/v1/cryptocurrency/listings/latest', {
                                 headers: { 'X-CMC_PRO_API_KEY': CMC_API_KEY },
-                                params: { start: 1, limit: 80, sort: 'percent_change_24h', sort_dir: 'desc', convert: 'EUR' }
+                                params: { start: 1, limit: 100, sort: 'volume_24h', sort_dir: 'desc', convert: 'EUR' }
                             });
-                            for (const coin of cmcResponse.data.data) {
-                                const baseSym = coin.symbol;
-                                if (stablecoinsToIgnore.includes(baseSym)) continue;
-                                const sym = `${baseSym}/EUR`;
-                                if (exchange.markets[sym] && exchange.markets[sym].active) {
-                                    topMoversList.push(sym);
-                                }
-                            }
+                            validatedWatchlist.sort((a, b) => {
+                                const baseA = a.split('/')[0];
+                                const baseB = b.split('/')[0];
+                                const coinA = cmcResponse.data.data.find(c => c.symbol === baseA);
+                                const coinB = cmcResponse.data.data.find(c => c.symbol === baseB);
+                                const volA = coinA ? coinA.quote.EUR.volume_24h : 0;
+                                const volB = coinB ? coinB.quote.EUR.volume_24h : 0;
+                                return volB - volA;
+                            });
                         } catch (e) {}
                     }
 
-                    if (topMoversList.length === 0) {
-                        let krakenTickers = await exchange.fetchTickers();
-                        let sortedKraken = Object.keys(krakenTickers)
-                            .filter(s => s.endsWith('/EUR') && !stablecoinsToIgnore.includes(s.split('/')[0].replace(/^[XZ]/, '')))
-                            .sort((a, b) => (krakenTickers[b].percentage || 0) - (krakenTickers[a].percentage || 0));
-                        topMoversList = sortedKraken;
-                    }
-
-                    focusedHotPool = topMoversList.slice(0, 5);
-                    watchedOutperformers = focusedHotPool;
+                    focusedHotPool = validatedWatchlist;
                     lastHotPoolUpdate = currentTime;
-                    console.log(`[Focus] Watchlist Top Movers stretta: ${focusedHotPool.join(', ')}`);
+                    console.log(`[Focus] Watchlist ordinata per volumi CMC: ${focusedHotPool.join(', ')}`);
                 }
 
-                // 5. SCANNER RAPIDO CON IMPORTO FISSO A 10€
+                if (!isBtcBullish) {
+                    console.log(`[Attesa] Termometro BTC 24h/4h/1h non favorevole. Bot in pausa.`);
+                    await new Promise(resolve => setTimeout(resolve, 30000));
+                    continue;
+                }
+
+                // 4. SCANNER SULLA WATCHLIST CON IMPORTO A 10€
                 for (const symbol of focusedHotPool) {
                     try {
                         if (!exchange.markets[symbol]) continue;
@@ -277,16 +302,16 @@ async function runBotLoop() {
                         const ohlcv5m = await exchange.fetchOHLCV(symbol, '5m', undefined, 20);
                         const techEval = evaluateTechnicalScore(ohlcv5m);
                         
-                        if (techEval.score < 4.0) continue; 
+                        if (techEval.score < 4.5) continue; 
 
-                        let targetInvestmentSize = 10; 
+                        let targetInvestmentSize = 10; // Importo fisso a 10€
                         if (eurBalance < targetInvestmentSize) targetInvestmentSize = eurBalance;
 
                         if (eurBalance >= 10 || eurBalance >= 5) {
                             const currentPrice = ohlcv5m[ohlcv5m.length - 1][4];
                             const amountToBuy = targetInvestmentSize / currentPrice;
                             
-                            console.log(`[Tentativo Buy] Invio ordine di acquisto per ${symbol} di €${targetInvestmentSize} (Quantità: ${amountToBuy}) a €${currentPrice}...`);
+                            console.log(`[Tentativo Buy] Ordine da €${targetInvestmentSize} su ${symbol} a €${currentPrice}...`);
                             
                             try {
                                 const order = await exchange.createMarketBuyOrder(symbol, amountToBuy);
@@ -297,8 +322,8 @@ async function runBotLoop() {
                                     time: Date.now()
                                 };
 
-                                console.log(`[TOP MOVER BUY OK - Score ${techEval.score}] Acquistati €${targetInvestmentSize} di ${symbol} a €${currentPrice.toFixed(4)} | ID: ${order.id}`);
-                                lastLog = `Acquistati €${targetInvestmentSize} di ${symbol} (Top Mover)`;
+                                console.log(`[BUY OK - Score ${techEval.score}] Acquistati €${targetInvestmentSize} di ${symbol} a €${currentPrice.toFixed(4)} | Motivi: ${techEval.details}`);
+                                lastLog = `Acquistati €${targetInvestmentSize} di ${symbol}`;
                                 
                                 await new Promise(resolve => setTimeout(resolve, 5000));
                                 break;
