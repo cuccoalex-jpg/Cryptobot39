@@ -17,7 +17,7 @@ const exchange = new ccxt.kraken({
 });
 
 let botRunning = true;
-let lastLog = "Bot avviato: Focalizzato sui Top Movers di Giornata + Anti-Stagnazione.";
+let lastLog = "Bot avviato: Importo fissa a 10€ + Top Movers + Anti-Stagnazione.";
 let watchedOutperformers = [];
 let focusedHotPool = [];
 let lastHotPoolUpdate = 0;
@@ -35,7 +35,7 @@ app.get('/', (req, res) => {
                 <h1>Cryptobot39 - Stato: ${botRunning ? 'ATTIVO & OPERATIVO' : 'FERMO'}</h1>
                 <p><b>Ultima attività:</b> ${lastLog}</p>
                 <p><b>Posizioni in Memoria Locale:</b> ${Object.keys(activePositions).length > 0 ? Object.keys(activePositions).join(', ') : 'Nessuna'}</p>
-                <p><b>Top Movers Monitorati (Focus Stretto):</b> ${focusedHotPool.length > 0 ? focusedHotPool.join(', ') : 'Sincronizzazione in corso...'}</p>
+                <p><b>Top Movers Monitorati (Focus 10€):</b> ${focusedHotPool.length > 0 ? focusedHotPool.join(', ') : 'Sincronizzazione in corso...'}</p>
             </body>
         </html>
     `);
@@ -63,18 +63,6 @@ function calculateRSI(closes, period = 14) {
     return 100 - (100 / (1 + rs));
 }
 
-function calculateBollingerBands(closes, period = 20, stdDevMultiplier = 2) {
-    if (!closes || closes.length < period) return { upper: 0, middle: 0, lower: 0, isSideways: false };
-    const slice = closes.slice(-period);
-    const middle = slice.reduce((a, b) => a + b, 0) / period;
-    const variance = slice.reduce((sum, val) => sum + Math.pow(val - middle, 2), 0) / period;
-    const stdDev = Math.sqrt(variance);
-    const upper = middle + (stdDevMultiplier * stdDev);
-    const lower = middle - (stdDevMultiplier * stdDev);
-    return { upper, middle, lower };
-}
-
-// VALUTAZIONE TECNICA MIRATA SUL MOMENTUM DEI TOP MOVERS
 function evaluateTechnicalScore(ohlcv) {
     if (!ohlcv || ohlcv.length < 20) return { score: 0, details: "Dati insufficienti" };
 
@@ -91,7 +79,6 @@ function evaluateTechnicalScore(ohlcv) {
     const rsi = calculateRSI(closes, 14);
     const isGreen = currentClose > prevClose;
 
-    // Se è un top mover, cerchiamo il piccolo pull-back o la ripartenza immediata
     const recentLow = Math.min(...lows.slice(-8, -1));
     if (currentClose <= recentLow * 1.015 || isGreen) {
         score += 3.0;
@@ -148,7 +135,7 @@ async function runBotLoop() {
                     return !stablecoinsToIgnore.includes(clean);
                 });
 
-                // 1. GESTIONE PORTAFOGLIO (TP, Fast-Cut e Time-Stop ridotto a 2.5 ore per i Top Movers)
+                // 1. GESTIONE PORTAFOGLIO (TP, Fast-Cut e Time-Stop a 2.5 ore)
                 for (const rawCurrency of assetKeys) {
                     let cleanCurrency = rawCurrency.replace(/^[XZ]/, '');
                     if (cleanCurrency === 'XBT') cleanCurrency = 'BTC';
@@ -187,7 +174,6 @@ async function runBotLoop() {
 
                         const profitPercentage = ((currentPrice - entryPrice) / entryPrice) * 100;
                         const hoursOpen = (Date.now() - entryTime) / (1000 * 60 * 60);
-                        // Time-Stop più stretto a 2.5 ore: se un top mover non spinge subito, usciamo e ruotiamo il capitale
                         const isStagnant = (hoursOpen > 2.5 && profitPercentage > -0.15 && profitPercentage < 0.3);
 
                         console.log(`[Wallet] ${symbol} | Ingresso: €${entryPrice.toFixed(4)} | Attuale: €${currentPrice.toFixed(4)} | PnL: ${profitPercentage.toFixed(2)}% | Ore: ${hoursOpen.toFixed(1)}h`);
@@ -240,7 +226,6 @@ async function runBotLoop() {
                         } catch (e) {}
                     }
 
-                    // Se CMC non risponde o per fallback, prendiamo i ticker da Kraken e filtriamo per variazione 24h
                     if (topMoversList.length === 0) {
                         let krakenTickers = await exchange.fetchTickers();
                         let sortedKraken = Object.keys(krakenTickers)
@@ -249,14 +234,13 @@ async function runBotLoop() {
                         topMoversList = sortedKraken;
                     }
 
-                    // RESTRINGIAMO IL FOCUS SOLO AI TOP 5 ABSOLUTI DELLA GIORNATA
                     focusedHotPool = topMoversList.slice(0, 5);
                     watchedOutperformers = focusedHotPool;
                     lastHotPoolUpdate = currentTime;
-                    console.log(`[Focus] Nuova watchlist Top Movers stretta: ${focusedHotPool.join(', ')}`);
+                    console.log(`[Focus] Watchlist Top Movers stretta: ${focusedHotPool.join(', ')}`);
                 }
 
-                // 3. SCANNER RAPIDO SU QUESTI 5 SPECIALISTI
+                // 3. SCANNER RAPIDO CON IMPORTO FISSO A 10€
                 for (const symbol of focusedHotPool) {
                     try {
                         if (!exchange.markets[symbol]) continue;
@@ -271,34 +255,44 @@ async function runBotLoop() {
                         
                         if (techEval.score < 4.0) continue; 
 
-                        let targetInvestmentSize = 5; 
+                        // IMPOSTIAMO 10€ DI INVESTIMENTO FISSO (o il saldo rimanente se inferiore a 10)
+                        let targetInvestmentSize = 10; 
                         if (eurBalance < targetInvestmentSize) targetInvestmentSize = eurBalance;
 
-                        if (eurBalance >= 5) {
+                        if (eurBalance >= 10 || eurBalance >= 5) {
                             const currentPrice = ohlcv5m[ohlcv5m.length - 1][4];
                             const amountToBuy = targetInvestmentSize / currentPrice;
-                            const order = await exchange.createMarketBuyOrder(symbol, amountToBuy);
                             
-                            activePositions[symbol] = {
-                                entryPrice: currentPrice,
-                                amount: amountToBuy,
-                                time: Date.now()
-                            };
+                            console.log(`[Tentativo Buy] Invio ordine di acquisto per ${symbol} di €${targetInvestmentSize} (Quantità: ${amountToBuy}) a €${currentPrice}...`);
+                            
+                            try {
+                                const order = await exchange.createMarketBuyOrder(symbol, amountToBuy);
+                                
+                                activePositions[symbol] = {
+                                    entryPrice: currentPrice,
+                                    amount: amountToBuy,
+                                    time: Date.now()
+                                };
 
-                            console.log(`[TOP MOVER BUY - Score ${techEval.score}] Acquistati €${targetInvestmentSize} di ${symbol} a €${currentPrice.toFixed(4)} | Motivi: ${techEval.details}`);
-                            lastLog = `Acquistati €${targetInvestmentSize} di ${symbol} (Top Mover)`;
-                            
-                            await new Promise(resolve => setTimeout(resolve, 5000));
-                            break;
+                                console.log(`[TOP MOVER BUY OK - Score ${techEval.score}] Acquistati €${targetInvestmentSize} di ${symbol} a €${currentPrice.toFixed(4)} | ID: ${order.id}`);
+                                lastLog = `Acquistati €${targetInvestmentSize} di ${symbol} (Top Mover)`;
+                                
+                                await new Promise(resolve => setTimeout(resolve, 5000));
+                                break;
+                            } catch (orderErr) {
+                                console.log(`[ERRORE ORDINE KRAKEN su ${symbol}]:`, orderErr.message);
+                            }
                         }
-                    } catch (altErr) {}
+                    } catch (altErr) {
+                        console.log(`[Errore ciclo altcoin]:`, altErr.message);
+                    }
                 }
             }
         } catch (err) {
             console.log("Errore nel ciclo principale:", err.message);
         }
 
-        await new Promise(resolve => setTimeout(resolve, 30000)); // Ciclo più reattivo ogni 30 secondi
+        await new Promise(resolve => setTimeout(resolve, 30000));
     }
 }
 
