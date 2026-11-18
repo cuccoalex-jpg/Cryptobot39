@@ -17,7 +17,7 @@ const exchange = new ccxt.kraken({
 });
 
 let botRunning = true;
-let lastLog = "Bot avviato: Importo fissa a 10€ + Top Movers + Anti-Stagnazione.";
+let lastLog = "Bot avviato: Termometro BTC Severo + Top Movers (10€) + Anti-Stagnazione.";
 let watchedOutperformers = [];
 let focusedHotPool = [];
 let lastHotPoolUpdate = 0;
@@ -111,6 +111,7 @@ async function runBotLoop() {
                 const eurBalance = balance.free['EUR'] || balance.free['ZEUR'] || 0;
                 console.log(`[${now}] Saldo EUR: €${eurBalance.toFixed(2)}`);
 
+                // 1. PROTEZIONE FLASH CRASH LIVE
                 let isLiveFlashCrash = false;
                 try {
                     const btcTicker = await exchange.fetchTicker('BTC/EUR');
@@ -121,6 +122,27 @@ async function runBotLoop() {
                     }
                     global.lastBtcLivePrice = btcCurrentLivePrice;
                 } catch (e) {}
+
+                // 2. TERMOMETRO BTC SEVERO (1h e 4h)
+                let isBtcBullish = false;
+                try {
+                    const btcOhlcv1h = await exchange.fetchOHLCV('BTC/EUR', '1h', undefined, 20);
+                    const btcCloses1h = btcOhlcv1h.map(c => c[4]);
+                    const btcPrice = btcCloses1h[btcCloses1h.length - 1];
+                    const btcOpen1h = btcOhlcv1h[btcOhlcv1h.length - 1][1];
+                    const btcChange1h = ((btcPrice - btcOpen1h) / btcOpen1h) * 100;
+
+                    const btcOhlcv4h = await exchange.fetchOHLCV('BTC/EUR', '4h', undefined, 10);
+                    const btcCloses4h = btcOhlcv4h.map(c => c[4]);
+                    const btcOpen4h = btcOhlcv4h[btcOhlcv4h.length - 1][1];
+                    const btcChange4h = ((btcPrice - btcOpen4h) / btcOpen4h) * 100;
+
+                    // Il termometro richiede Bitcoin in salute su entrambi i timeframe
+                    isBtcBullish = (btcChange1h > 0.1 && btcChange4h >= -0.1 && !isLiveFlashCrash);
+                    console.log(`[Termometro BTC] 1h: ${btcChange1h.toFixed(2)}% | 4h: ${btcChange4h.toFixed(2)}% | Stato Bullish: ${isBtcBullish}`);
+                } catch (btcErr) {
+                    isBtcBullish = false;
+                }
 
                 const targetTakeProfitLordo = 1.12; 
                 const thresholdFastCut = -0.2; 
@@ -135,7 +157,7 @@ async function runBotLoop() {
                     return !stablecoinsToIgnore.includes(clean);
                 });
 
-                // 1. GESTIONE PORTAFOGLIO (TP, Fast-Cut e Time-Stop a 2.5 ore)
+                // 3. GESTIONE PORTAFOGLIO (TP, Fast-Cut e Time-Stop a 2.5 ore)
                 for (const rawCurrency of assetKeys) {
                     let cleanCurrency = rawCurrency.replace(/^[XZ]/, '');
                     if (cleanCurrency === 'XBT') cleanCurrency = 'BTC';
@@ -200,12 +222,14 @@ async function runBotLoop() {
                     }
                 }
 
-                if (isLiveFlashCrash) {
+                // Se il termometro BTC è spento o c'è flash crash, saltiamo gli acquisti di nuove altcoin
+                if (!isBtcBullish || isLiveFlashCrash) {
+                    console.log(`[Attesa] Termometro BTC non favorevole o Flash Crash in corso. Nuovi acquisti sospesi.`);
                     await new Promise(resolve => setTimeout(resolve, 30000));
                     continue;
                 }
 
-                // 2. SELEZIONE RISTRETTA DEI TOP 5 MOVERS DI GIORNATA
+                // 4. SELEZIONE RISTRETTA DEI TOP 5 MOVERS DI GIORNATA
                 const currentTime = Date.now();
                 if (focusedHotPool.length === 0 || (currentTime - lastHotPoolUpdate > 10 * 60 * 1000)) {
                     let topMoversList = [];
@@ -240,7 +264,7 @@ async function runBotLoop() {
                     console.log(`[Focus] Watchlist Top Movers stretta: ${focusedHotPool.join(', ')}`);
                 }
 
-                // 3. SCANNER RAPIDO CON IMPORTO FISSO A 10€
+                // 5. SCANNER RAPIDO CON IMPORTO FISSO A 10€
                 for (const symbol of focusedHotPool) {
                     try {
                         if (!exchange.markets[symbol]) continue;
@@ -255,7 +279,6 @@ async function runBotLoop() {
                         
                         if (techEval.score < 4.0) continue; 
 
-                        // IMPOSTIAMO 10€ DI INVESTIMENTO FISSO (o il saldo rimanente se inferiore a 10)
                         let targetInvestmentSize = 10; 
                         if (eurBalance < targetInvestmentSize) targetInvestmentSize = eurBalance;
 
