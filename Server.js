@@ -17,7 +17,7 @@ const exchange = new ccxt.kraken({
 });
 
 let botRunning = true;
-let lastLog = "Bot avviato: Timeframe 15m + Termometro BTC + Filtro News CMC + Fast Cut (10€).";
+let lastLog = "Bot avviato: Termometro BTC Rigido + Ingresso 15m Severo + Fast Cut (10€).";
 let focusedHotPool = [];
 let lastHotPoolUpdate = 0;
 global.lastBtcLivePrice = 0;
@@ -34,9 +34,11 @@ const customWatchlistSymbols = [
     'EIGEN/EUR', 'ENA/EUR'
 ];
 
-// Soglie regolabili del Termometro BTC
+// Soglie più severe per evitare acquisti mentre BTC cala
 const BTC_FLASH_CRASH_DROP_RATIO = 0.985; // -1.5% tra due letture live
-const BTC_MAX_DROP_1H_PERCENT = -2.0;    // Blocca nuovi acquisti se BTC scende oltre -2.0% sull'ultima ora
+const BTC_MAX_DROP_1H_PERCENT = -0.8;    // Blocca se BTC scende oltre -0.8% nell'ultima ora
+const BTC_MAX_DROP_3H_PERCENT = -1.5;    // Blocca se BTC scende oltre -1.5% in 3 ore
+const MIN_ENTRY_SCORE_15M = 6.5;         // Soglia d'ingresso 15m più selettiva
 
 app.get('/', (req, res) => {
     res.send(`
@@ -103,11 +105,13 @@ async function checkLiveNewsAndSentiment() {
     }
 }
 
-// TERMOMETRO BTC: flash crash live + variazione ultima ora
+// TERMOMETRO BTC PIÙ RIGIDO: blocca durante cali 1h, 3h o trend ribassista in corso
 async function evaluateBtcThermometer() {
     let isLiveFlashCrash = false;
     let isBtcHealthy = true;
     let btcChange1h = 0;
+    let btcChange3h = 0;
+    let blockReason = "";
 
     try {
         const btcTicker = await exchange.fetchTicker('BTC/EUR');
@@ -115,35 +119,54 @@ async function evaluateBtcThermometer() {
         if (global.lastBtcLivePrice && btcCurrentLivePrice < global.lastBtcLivePrice * BTC_FLASH_CRASH_DROP_RATIO) {
             console.log(`[FLASH CRASH] BTC a €${btcCurrentLivePrice}! Sospensione totale.`);
             isLiveFlashCrash = true;
+            blockReason = "Flash Crash live";
         }
         global.lastBtcLivePrice = btcCurrentLivePrice;
     } catch (e) {}
 
     try {
-        const btcOhlcv1h = await exchange.fetchOHLCV('BTC/EUR', '1h', undefined, 4);
-        if (btcOhlcv1h && btcOhlcv1h.length >= 2) {
+        const btcOhlcv1h = await exchange.fetchOHLCV('BTC/EUR', '1h', undefined, 5);
+        if (btcOhlcv1h && btcOhlcv1h.length >= 4) {
             const lastCandle = btcOhlcv1h[btcOhlcv1h.length - 1];
+            const prevCandle = btcOhlcv1h[btcOhlcv1h.length - 2];
+            const candle3hAgo = btcOhlcv1h[btcOhlcv1h.length - 4];
+
             btcChange1h = ((lastCandle[4] - lastCandle[1]) / lastCandle[1]) * 100;
-            if (btcChange1h < BTC_MAX_DROP_1H_PERCENT || isLiveFlashCrash) {
+            btcChange3h = ((lastCandle[4] - candle3hAgo[1]) / candle3hAgo[1]) * 100;
+
+            const isStillDropping = (btcChange1h < -0.5) && (lastCandle[4] < prevCandle[4]);
+
+            if (isLiveFlashCrash) {
                 isBtcHealthy = false;
+            } else if (btcChange1h < BTC_MAX_DROP_1H_PERCENT) {
+                isBtcHealthy = false;
+                blockReason = `Calo 1h ${btcChange1h.toFixed(2)}% < ${BTC_MAX_DROP_1H_PERCENT}%`;
+            } else if (btcChange3h < BTC_MAX_DROP_3H_PERCENT) {
+                isBtcHealthy = false;
+                blockReason = `Calo 3h ${btcChange3h.toFixed(2)}% < ${BTC_MAX_DROP_3H_PERCENT}%`;
+            } else if (isStillDropping) {
+                isBtcHealthy = false;
+                blockReason = `BTC in discesa continua (1h ${btcChange1h.toFixed(2)}%)`;
             }
         }
     } catch (btcErr) {
         isBtcHealthy = true;
     }
 
-    return { isLiveFlashCrash, isBtcHealthy, btcChange1h };
+    return { isLiveFlashCrash, isBtcHealthy, btcChange1h, btcChange3h, blockReason };
 }
 
-// VALUTAZIONE TECNICA SU 15 MINUTI
+// VALUTAZIONE TECNICA SU 15 MINUTI: più severa per ridurre ingressi deboli
 function evaluateTechnicalScore15m(ohlcv) {
     if (!ohlcv || ohlcv.length < 22) return { score: 0, details: "Dati insufficienti" };
 
     const closes = ohlcv.map(c => c[4]);
+    const opens = ohlcv.map(c => c[1]);
     const lows = ohlcv.map(c => c[3]);
     const volumes = ohlcv.map(c => c[5]);
 
     const currentClose = closes[closes.length - 1];
+    const currentOpen = opens[opens.length - 1];
     const prevClose = closes[closes.length - 2];
     const prevLow = lows[lows.length - 2];
 
@@ -154,28 +177,34 @@ function evaluateTechnicalScore15m(ohlcv) {
     const prevRsi = calculateRSI(closes.slice(0, -1), 14);
     const bollinger = calculateBollingerBands(closes);
 
+    // Deve esserci una reazione verde reale sopra la candela precedente e sopra l'apertura della candela attuale
+    const isGreenReaction = (currentClose > prevClose) && (currentClose >= currentOpen);
     const recentLow = Math.min(...lows.slice(-10, -2));
-    const testedSupportAndReacted = (prevLow <= recentLow * 1.008) && (currentClose > prevClose);
-    const lowerBollingerReaction = (currentClose <= bollinger.lower * 1.01) && (currentClose > prevClose);
+    const testedSupportAndReacted = (prevLow <= recentLow * 1.006) && isGreenReaction;
+    const lowerBollingerReaction = (prevLow <= bollinger.lower * 1.006) && isGreenReaction;
 
     if (testedSupportAndReacted || lowerBollingerReaction) {
         score += 3.5;
-        reasons.push("Reazione 15m su Supporto/Bollinger");
+        reasons.push("Reazione Verde 15m su Supporto/Bollinger");
+    } else {
+        score -= 2.0;
     }
 
-    if (rsi >= 32 && rsi <= 62 && rsi > prevRsi) {
+    // RSI in risalita reale da zona non tirata
+    if (rsi >= 34 && rsi <= 58 && rsi > prevRsi + 1.0) {
         score += 2.0;
-        reasons.push(`RSI 15m in Risalita (${prevRsi.toFixed(1)} -> ${rsi.toFixed(1)})`);
+        reasons.push(`RSI 15m in Girata (${prevRsi.toFixed(1)} -> ${rsi.toFixed(1)})`);
     }
 
+    // Volumi superiori alla media con candela verde
     const avgVolume = volumes.slice(-8, -1).reduce((a, b) => a + b, 0) / 7;
     const lastVolume = volumes[volumes.length - 1];
 
-    if (lastVolume > avgVolume * 1.25 && currentClose > prevClose) {
+    if (lastVolume > avgVolume * 1.3 && isGreenReaction) {
         score += 2.5;
-        reasons.push("Volumi 15m Sopra Media");
-    } else if (lastVolume < avgVolume * 0.85) {
-        score -= 1.5;
+        reasons.push("Volumi 15m Confermati");
+    } else if (lastVolume < avgVolume * 0.9) {
+        score -= 2.0;
     }
 
     return { score, details: reasons.join(" + ") };
@@ -200,9 +229,9 @@ async function runBotLoop() {
                     continue;
                 }
 
-                // 1. TERMOMETRO BTC
+                // 1. TERMOMETRO BTC RIGIDO
                 const btcThermometer = await evaluateBtcThermometer();
-                const { isLiveFlashCrash, isBtcHealthy, btcChange1h } = btcThermometer;
+                const { isLiveFlashCrash, isBtcHealthy, btcChange1h, btcChange3h, blockReason } = btcThermometer;
 
                 const targetTakeProfitLordo = 1.12;
                 const thresholdStopLoss = -1.0;
@@ -321,12 +350,12 @@ async function runBotLoop() {
                 }
 
                 if (!isBtcHealthy) {
-                    console.log(`[Termometro BTC] 1h ${btcChange1h.toFixed(2)}% (soglia ${BTC_MAX_DROP_1H_PERCENT}%). Nuovi acquisti in pausa.`);
+                    console.log(`[Termometro BTC BLOCCATO] ${blockReason} (1h: ${btcChange1h.toFixed(2)}%, 3h: ${btcChange3h.toFixed(2)}%). Nuovi acquisti sospesi.`);
                     await new Promise(resolve => setTimeout(resolve, 30000));
                     continue;
                 }
 
-                // 4. SCANNER SU CANDELA 15M CON IMPORTO A 10€
+                // 4. SCANNER SU CANDELA 15M CON IMPORTO A 10€ E SOGLIA 6.5
                 for (const symbol of focusedHotPool) {
                     try {
                         if (!exchange.markets[symbol]) continue;
@@ -339,7 +368,7 @@ async function runBotLoop() {
                         const ohlcv15m = await exchange.fetchOHLCV(symbol, '15m', undefined, 25);
                         const techEval = evaluateTechnicalScore15m(ohlcv15m);
 
-                        if (techEval.score < 5.5) continue;
+                        if (techEval.score < MIN_ENTRY_SCORE_15M) continue;
 
                         let targetInvestmentSize = 10;
                         if (eurBalance < targetInvestmentSize) targetInvestmentSize = eurBalance;
