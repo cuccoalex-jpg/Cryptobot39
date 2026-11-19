@@ -17,7 +17,7 @@ const exchange = new ccxt.kraken({
 });
 
 let botRunning = true;
-let lastLog = "Bot avviato: Termometro BTC Severo + Rimbalzi 5m + Take Profit Dinamico (10€).";
+let lastLog = "Bot avviato: Livelli BTC + Termometro Severo + Rimbalzi 5m + Take Profit Dinamico (10€).";
 let focusedHotPool = [];
 let dailyWinnersSet = new Set();
 let lastHotPoolUpdate = 0;
@@ -49,7 +49,7 @@ const TRAILING_FLOOR_GROSS_PCT = 0.25;        // Protezione minima sopra le fee 
 const TRAILING_PULLBACK_PCT = 0.45;           // Chiude se scende di 0.45% dal picco raggiunto
 const STOP_LOSS_FAST_CUT_PCT = -1.0;          // Fast-cut / stop loss
 
-// Termometro BTC SEVERO (anti-crollo + isteresi lunga)
+// Termometro BTC SEVERO + Livelli
 const BTC_FLASH_CRASH_DROP_RATIO = 0.990;     // -1.0% tra due letture live
 const BTC_MAX_DROP_1H_PERCENT = -0.5;        // Blocca se BTC scende oltre -0.5% nell'ultima ora
 const BTC_MAX_DROP_3H_PERCENT = -1.0;        // Blocca se BTC scende oltre -1.0% in 3 ore
@@ -122,7 +122,57 @@ async function checkLiveNewsAndSentiment() {
     }
 }
 
-// TERMOMETRO BTC SEVERO CON ISTERESI LUNGA
+// ANALISI LIVELLI BTC (Supporto recente, rottura supporto, resistenza locale e frenata)
+function analyzeBtcLevels(ohlcv15m, currentPrice) {
+    if (!ohlcv15m || ohlcv15m.length < 12) {
+        return {
+            recentSupport: 0,
+            recentResistance: 0,
+            supportBroken: false,
+            isHoldingOrBraking: false,
+            distToSupportPct: 0,
+            levelSummary: "Livelli N/D"
+        };
+    }
+
+    const highs = ohlcv15m.map(c => c[2]);
+    const lows = ohlcv15m.map(c => c[3]);
+    const closes = ohlcv15m.map(c => c[4]);
+
+    // Escludiamo le ultime 2 candele dal calcolo del supporto storico per trovare il pavimento precedente
+    const historicalLows = lows.slice(-20, -2);
+    const recentSupport = historicalLows.length > 0 ? Math.min(...historicalLows) : Math.min(...lows);
+
+    const historicalHighs = highs.slice(-20, -1);
+    const recentResistance = historicalHighs.length > 0 ? Math.max(...historicalHighs) : Math.max(...highs);
+
+    const lastClose = closes[closes.length - 1];
+    const prevClose = closes[closes.length - 2];
+    const lastLow = lows[lows.length - 1];
+    const prevLow = lows[lows.length - 2];
+
+    const effectivePrice = currentPrice > 0 ? currentPrice : lastClose;
+    const distToSupportPct = recentSupport > 0 ? ((effectivePrice - recentSupport) / recentSupport) * 100 : 0;
+
+    // Supporto rotto se chiude sotto il supporto con margine > 0.35%
+    const supportBroken = recentSupport > 0 && lastClose < (recentSupport * 0.9965);
+
+    // Frenata / non-affondo: non sta facendo nuovi minimi peggiori del minimo precedente e non chiude sotto il supporto
+    const noFreshBreakdown = !supportBroken && (lastLow >= prevLow * 0.999 || lastClose >= prevClose);
+
+    const levelSummary = `Supp €${recentSupport.toFixed(0)} (${distToSupportPct >= 0 ? '+' : ''}${distToSupportPct.toFixed(2)}%) | Res €${recentResistance.toFixed(0)} | ${supportBroken ? 'ROTTURA SUPP' : (noFreshBreakdown ? 'FRENATA/TENUTA' : 'SPINTA GIÙ')}`;
+
+    return {
+        recentSupport,
+        recentResistance,
+        supportBroken,
+        isHoldingOrBraking: noFreshBreakdown,
+        distToSupportPct,
+        levelSummary
+    };
+}
+
+// TERMOMETRO BTC SEVERO CON ISTERESI LUNGA + LETTURA LIVELLI
 async function evaluateBtcThermometer() {
     let isLiveFlashCrash = false;
     let isBtcHealthy = true;
@@ -130,10 +180,11 @@ async function evaluateBtcThermometer() {
     let btcChange3h = 0;
     let btcChange15m4c = 0;
     let blockReason = "";
+    let btcCurrentLivePrice = 0;
 
     try {
         const btcTicker = await exchange.fetchTicker('BTC/EUR');
-        const btcCurrentLivePrice = btcTicker.last;
+        btcCurrentLivePrice = btcTicker.last;
         if (global.lastBtcLivePrice && btcCurrentLivePrice < global.lastBtcLivePrice * BTC_FLASH_CRASH_DROP_RATIO) {
             console.log(`[FLASH CRASH] BTC a €${btcCurrentLivePrice}! Sospensione totale.`);
             isLiveFlashCrash = true;
@@ -155,7 +206,6 @@ async function evaluateBtcThermometer() {
             btcChange1h = ((lastCandle[4] - lastCandle[1]) / lastCandle[1]) * 100;
             btcChange3h = ((lastCandle[4] - candle3hAgo[1]) / candle3hAgo[1]) * 100;
 
-            // Qualsiasi candela 1h che chiude sotto la precedente con calo > -0.25% è considerata debolezza attiva
             isStillDropping = (lastCandle[4] < prevCandle[4]) && (btcChange1h < -0.25);
 
             if (btcChange1h < BTC_MAX_DROP_1H_PERCENT) {
@@ -171,37 +221,69 @@ async function evaluateBtcThermometer() {
         }
     } catch (btcErr) {}
 
+    let levelInfo = {
+        recentSupport: 0,
+        recentResistance: 0,
+        supportBroken: false,
+        isHoldingOrBraking: false,
+        distToSupportPct: 0,
+        levelSummary: "Livelli N/D"
+    };
+
     try {
-        const btcOhlcv15m = await exchange.fetchOHLCV('BTC/EUR', '15m', undefined, 6);
+        const btcOhlcv15m = await exchange.fetchOHLCV('BTC/EUR', '15m', undefined, 24);
         if (btcOhlcv15m && btcOhlcv15m.length >= 5) {
             const recent15m = btcOhlcv15m[btcOhlcv15m.length - 1];
             const fourCandlesAgo15m = btcOhlcv15m[btcOhlcv15m.length - 5];
             btcChange15m4c = ((recent15m[4] - fourCandlesAgo15m[1]) / fourCandlesAgo15m[1]) * 100;
+
+            levelInfo = analyzeBtcLevels(btcOhlcv15m, btcCurrentLivePrice);
+
             if (btcChange15m4c < BTC_MAX_DROP_15M_4C_PERCENT) {
                 btcLockedUntil = Date.now() + BTC_LOCK_DURATION_MS;
                 blockReason = blockReason || `Calo 15m (4 candele) ${btcChange15m4c.toFixed(2)}% < ${BTC_MAX_DROP_15M_4C_PERCENT}%`;
             }
+
+            if (levelInfo.supportBroken) {
+                btcLockedUntil = Date.now() + BTC_LOCK_DURATION_MS;
+                blockReason = blockReason || `Supporto BTC €${levelInfo.recentSupport.toFixed(0)} rotto`;
+            }
         }
     } catch (e15) {}
 
-    // Mantiene il blocco finché scade il lock AND BTC ha recuperato chiaramente (sopra -0.2% su 1h e senza discesa in corso)
+    // Il termometro resta severo: non sblocca mai solo per il tocco di un livello se il lock o il calo è attivo
     if (isLiveFlashCrash) {
         isBtcHealthy = false;
         blockReason = blockReason || "Flash Crash live";
-    } else if (Date.now() < btcLockedUntil || btcChange1h < BTC_MAX_DROP_1H_PERCENT || btcChange3h < BTC_MAX_DROP_3H_PERCENT || btcChange15m4c < BTC_MAX_DROP_15M_4C_PERCENT || isStillDropping) {
-        if (Date.now() >= btcLockedUntil && btcChange1h > -0.20 && btcChange3h > -0.60 && btcChange15m4c > -0.25 && !isStillDropping) {
+    } else if (
+        Date.now() < btcLockedUntil ||
+        btcChange1h < BTC_MAX_DROP_1H_PERCENT ||
+        btcChange3h < BTC_MAX_DROP_3H_PERCENT ||
+        btcChange15m4c < BTC_MAX_DROP_15M_4C_PERCENT ||
+        isStillDropping ||
+        levelInfo.supportBroken
+    ) {
+        if (
+            Date.now() >= btcLockedUntil &&
+            btcChange1h > -0.20 &&
+            btcChange3h > -0.60 &&
+            btcChange15m4c > -0.25 &&
+            !isStillDropping &&
+            !levelInfo.supportBroken &&
+            levelInfo.isHoldingOrBraking
+        ) {
             btcLockedUntil = 0;
             isBtcHealthy = true;
         } else {
             isBtcHealthy = false;
             const remainingMin = Math.max(0, Math.ceil((btcLockedUntil - Date.now()) / 60000));
             if (!blockReason) {
-                blockReason = `Blocco severo BTC attivo (ancora ~${remainingMin}m, 1h ${btcChange1h.toFixed(2)}%)`;
+                blockReason = `Blocco severo BTC attivo (~${remainingMin}m, ${levelInfo.levelSummary})`;
             }
         }
     }
 
-    return { isLiveFlashCrash, isBtcHealthy, btcChange1h, btcChange3h, btcChange15m4c, blockReason };
+    return { isLiveFlashCrash, isBtcHealthy, btcChange1h, btcChange3h, btcChange15m4c, blockReason, levelInfo };
 }
 
 // VALUTA STRUTTURA A V E CALCOLA TAKE PROFIT DINAMICO
@@ -317,13 +399,13 @@ async function runBotLoop() {
                 const newsCheck = await checkLiveNewsAndSentiment();
                 if (newsCheck.safeMode) {
                     console.log(`[NEWS / SENTIMENT ALERT] ${newsCheck.reason}. Bot in pausa protettiva.`);
-                    await new Promise(resolve => setTimeout(resolve, 30000));
+                    await new Promise(resolve => setTimeout(resolve, 20000));
                     continue;
                 }
 
-                // 1. TERMOMETRO BTC SEVERO
+                // 1. TERMOMETRO BTC SEVERO + LIVELLI
                 const btcThermometer = await evaluateBtcThermometer();
-                const { isLiveFlashCrash, isBtcHealthy, btcChange1h, btcChange3h, btcChange15m4c, blockReason } = btcThermometer;
+                const { isLiveFlashCrash, isBtcHealthy, btcChange1h, btcChange3h, btcChange15m4c, blockReason, levelInfo } = btcThermometer;
 
                 const totalBalances = balance.total || {};
                 const assetKeys = Object.keys(totalBalances).filter(rawCurrency => {
@@ -484,7 +566,7 @@ async function runBotLoop() {
                 }
 
                 if (!isBtcHealthy) {
-                    console.log(`[Termometro BTC SEVERO BLOCCATO] ${blockReason} (1h: ${btcChange1h.toFixed(2)}%, 3h: ${btcChange3h.toFixed(2)}%, 15m/4c: ${btcChange15m4c.toFixed(2)}%). Nuovi acquisti sospesi.`);
+                    console.log(`[Termometro BTC SEVERO BLOCCATO] ${blockReason} | 1h: ${btcChange1h.toFixed(2)}%, 3h: ${btcChange3h.toFixed(2)}%, 15m/4c: ${btcChange15m4c.toFixed(2)}% | ${levelInfo.levelSummary}. Nuovi acquisti sospesi.`);
                     await new Promise(resolve => setTimeout(resolve, 20000));
                     continue;
                 }
