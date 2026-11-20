@@ -17,14 +17,15 @@ const exchange = new ccxt.kraken({
 });
 
 let botRunning = true;
-let lastLog = "Bot avviato: Tracciamento Prezzi + Filtro Probabilità Target + Termometro BTC Severo (10€).";
+let lastLog = "Bot avviato: Versione Completa 5m + Filtro Polvere/Residui + Tracciamento + Termometro BTC Severo (10€).";
 let focusedHotPool = [];
 let dailyWinnersSet = new Set();
 let lastHotPoolUpdate = 0;
 global.lastBtcLivePrice = 0;
 
 let activePositions = {};
-let priceTracker = {}; // Traccia storico prezzi, minimi/massimi osservati e trend locale per simbolo
+let priceTracker = {};
+let stoppedSymbolsCooldown = {}; // Blocco temporaneo per singola coppia dopo stop loss
 let btcLockedUntil = 0;
 let lastBuyTimestamp = 0;
 
@@ -47,14 +48,19 @@ const ESTIMATED_ROUNDTRIP_FEE_PCT = 0.50;     // Fee andata/ritorno + spread sti
 const BASE_TP_NET_PCT = 0.75;                 // ~1.25% lordo Take Profit base
 const EXTENDED_V_TP_NET_PCT = 1.45;           // ~1.95% lordo Take Profit esteso su V ampia e mercato sano
 const TRAILING_ARM_GROSS_PCT = 0.85;          // Sopra +0.85% lordo arma il trailing stop
-const TRAILING_FLOOR_GROSS_PCT = 0.25;        // Protezione minima sopra le fee una volta armato
-const TRAILING_PULLBACK_PCT = 0.45;           // Chiude se scende di 0.45% dal picco raggiunto
+const TRAILING_FLOOR_GROSS_PCT = 0.30;        // Protezione minima sopra le fee una volta armato
+const TRAILING_PULLBACK_PCT = 0.40;           // Chiude se scende di 0.40% dal picco raggiunto
 const STOP_LOSS_FAST_CUT_PCT = -1.0;          // Fast-cut / stop loss
 
-// Certezza in ingresso & tracciamento prezzi
-const MIN_ENTRY_SCORE_5M = 7.2;               // Soglia più alta per ridurre ingressi incerti
-const MIN_UPSIDE_ROOM_GROSS_PCT = 1.35;       // Chiede spazio potenziale verso resistenza/banda superiore almeno del 1.35%
-const BUY_COOLDOWN_MS = 15 * 60 * 1000;       // Almeno 15 minuti tra un acquisto e il successivo
+// Filtro residui / briciole in portafoglio (ignora micro-resti tipo 0.001 o controvalore irrisorio)
+const MIN_TRACKED_POSITION_EUR = 1.50;        // Sotto €1.50 viene considerato residuo / polvere
+const MIN_COIN_AMOUNT_FLOOR = 0.002;          // Sotto 0.002 unità non viene trattato come posizione attiva
+
+// Certezza in ingresso, tracciamento prezzi e cooldown
+const MIN_ENTRY_SCORE_5M = 7.2;
+const MIN_UPSIDE_ROOM_GROSS_PCT = 1.35;
+const BUY_COOLDOWN_MS = 15 * 60 * 1000;       // Almeno 15 minuti tra un acquisto e l'altro
+const SYMBOL_STOP_COOLDOWN_MS = 45 * 60 * 1000; // 45 minuti di pausa sulla coppia appena stoppata
 
 // Termometro BTC SEVERO + Livelli
 const BTC_FLASH_CRASH_DROP_RATIO = 0.990;     // -1.0% tra due letture live
@@ -70,7 +76,7 @@ app.get('/', (req, res) => {
             <body style="font-family: Arial; padding: 20px; background: #111; color: #fff;">
                 <h1>Cryptobot39 - Stato: ${botRunning ? 'ATTIVO & OPERATIVO' : 'FERMO'}</h1>
                 <p><b>Ultima attività:</b> ${lastLog}</p>
-                <p><b>Posizioni in Memoria Locale:</b> ${Object.keys(activePositions).length > 0 ? Object.keys(activePositions).join(', ') : 'Nessuna'}</p>
+                <p><b>Posizioni Attive (>= €${MIN_TRACKED_POSITION_EUR}):</b> ${Object.keys(activePositions).length > 0 ? Object.keys(activePositions).join(', ') : 'Nessuna'}</p>
                 <p><b>Watchlist Attiva (5m):</b> ${focusedHotPool.length > 0 ? focusedHotPool.join(', ') : 'Sincronizzazione in corso...'}</p>
             </body>
         </html>
@@ -110,7 +116,17 @@ function calculateBollingerBands(closes, period = 20, stdDevMultiplier = 2) {
     return { upper, middle, lower };
 }
 
-// TRACCIAMENTO PREZZI CICLO DOPO CICLO: verifica se il prezzo ha fermato la discesa e sta risalendo
+// Verifica se un saldo residuo è davvero una posizione rilevante o solo polvere/frazione insignificante
+function isMeaningfulHolding(amount, priceEur) {
+    if (!amount || amount <= MIN_COIN_AMOUNT_FLOOR) return false;
+    if (priceEur && priceEur > 0) {
+        const estimatedEur = amount * priceEur;
+        return estimatedEur >= MIN_TRACKED_POSITION_EUR;
+    }
+    return amount >= 0.01;
+}
+
+// TRACCIAMENTO PREZZI CICLO DOPO CICLO: verifica tenuta, almeno 2 passi in risalita e minimo non fresco
 function trackPriceAndEvaluateRebound(symbol, currentPrice) {
     const now = Date.now();
     if (!priceTracker[symbol]) {
@@ -130,7 +146,6 @@ function trackPriceAndEvaluateRebound(symbol, currentPrice) {
     const tracker = priceTracker[symbol];
     const lastSample = tracker.samples[tracker.samples.length - 1];
 
-    // Registra un nuovo campione se cambia prezzo o se sono passati almeno 20s
     if (!lastSample || lastSample.price !== currentPrice || (now - lastSample.ts) >= 20000) {
         tracker.samples.push({ price: currentPrice, ts: now });
         if (tracker.samples.length > 20) {
@@ -145,7 +160,6 @@ function trackPriceAndEvaluateRebound(symbol, currentPrice) {
         tracker.trackedHigh = currentPrice;
     }
 
-    // Se il prezzo ha fatto un nuovo minimo recente troppo fresco (< 45s fa), non ha ancora dimostrato tenuta
     const lowestSample = tracker.samples.reduce((minS, s) => s.price < minS.price ? s : minS, tracker.samples[0]);
     const ageSinceLowestSec = (now - lowestSample.ts) / 1000;
 
@@ -153,21 +167,25 @@ function trackPriceAndEvaluateRebound(symbol, currentPrice) {
         ? ((currentPrice - tracker.trackedLow) / tracker.trackedLow) * 100
         : 0;
 
-    // Rebound tracciato valido: almeno 3 campioni osservati, minimo formato da almeno 45s, prezzo sopra il minimo tracciato e in risalita rispetto all'ultimo campione
-    const isRisingNow = tracker.samples.length >= 2 && currentPrice >= tracker.samples[tracker.samples.length - 2].price;
+    const len = tracker.samples.length;
+    const twoStepRising = len >= 3 &&
+        tracker.samples[len - 1].price >= tracker.samples[len - 2].price &&
+        tracker.samples[len - 2].price >= tracker.samples[len - 3].price &&
+        tracker.samples[len - 1].price > tracker.samples[len - 3].price;
+
     const isTrackedReboundValid =
-        tracker.samples.length >= 3 &&
+        len >= 3 &&
         ageSinceLowestSec >= 45 &&
-        reboundFromTrackedLowPct >= 0.20 &&
-        reboundFromTrackedLowPct <= 1.60 &&
-        isRisingNow;
+        reboundFromTrackedLowPct >= 0.25 &&
+        reboundFromTrackedLowPct <= 1.50 &&
+        twoStepRising;
 
     return {
-        samplesCount: tracker.samples.length,
+        samplesCount: len,
         reboundFromTrackedLowPct,
         isTrackedReboundValid,
         reason: isTrackedReboundValid
-            ? `Tracciato +${reboundFromTrackedLowPct.toFixed(2)}% dal minimo (${ageSinceLowestSec.toFixed(0)}s)`
+            ? `Tracciato +${reboundFromTrackedLowPct.toFixed(2)}% dal minimo (2 passi su, ${ageSinceLowestSec.toFixed(0)}s)`
             : `In attesa conferma tracciamento (min ${ageSinceLowestSec.toFixed(0)}s, +${reboundFromTrackedLowPct.toFixed(2)}%)`
     };
 }
@@ -186,7 +204,6 @@ function evaluateProfitPotential(ohlcv5m, currentPrice, expectedTpGrossPct) {
     const roomToHighPct = recentHigh > currentPrice ? ((recentHigh - currentPrice) / currentPrice) * 100 : 0;
     const roomToUpperBandPct = bollinger.upper > currentPrice ? ((bollinger.upper - currentPrice) / currentPrice) * 100 : 0;
 
-    // Spazio realistico stimato: non deve essere già schiacciato contro il massimo locale o la banda superiore
     const effectiveRoomPct = Math.max(roomToHighPct, roomToUpperBandPct);
     const requiredRoomPct = Math.max(MIN_UPSIDE_ROOM_GROSS_PCT, expectedTpGrossPct * 0.95);
     const hasRoom = effectiveRoomPct >= requiredRoomPct;
@@ -516,13 +533,15 @@ async function runBotLoop() {
                 const assetKeys = Object.keys(totalBalances).filter(rawCurrency => {
                     if (stablecoinsToIgnore.includes(rawCurrency)) return false;
                     const amt = totalBalances[rawCurrency] || 0;
-                    if (amt <= 0.0001) return false;
+                    if (amt <= MIN_COIN_AMOUNT_FLOOR) return false;
                     let clean = rawCurrency.replace(/^[XZ]/, '');
                     if (clean === 'XBT') clean = 'BTC';
                     return !stablecoinsToIgnore.includes(clean);
                 });
 
-                // 2. GESTIONE PORTAFOGLIO (Take Profit Dinamico + Trailing Stop + Uscita V + 6 Candele / 30m)
+                // 2. GESTIONE PORTAFOGLIO (ignora briciole/polvere sotto MIN_TRACKED_POSITION_EUR)
+                const trackedSymbolsSet = new Set();
+
                 for (const rawCurrency of assetKeys) {
                     let cleanCurrency = rawCurrency.replace(/^[XZ]/, '');
                     if (cleanCurrency === 'XBT') cleanCurrency = 'BTC';
@@ -534,8 +553,19 @@ async function runBotLoop() {
                     }
 
                     try {
+                        const totalAmt = totalBalances[rawCurrency] || 0;
+                        const freeCoinAmount = balance.free[rawCurrency] || balance.free[cleanCurrency] || balance.free[`X${cleanCurrency}`] || balance.free[`Z${cleanCurrency}`] || 0;
+
                         const ticker = await exchange.fetchTicker(symbol);
                         const currentPrice = ticker.last;
+
+                        // Controllo anti-polvere / residui irrisori (es. 0.001 o controvalore < €1.50)
+                        if (!isMeaningfulHolding(totalAmt, currentPrice) || !isMeaningfulHolding(freeCoinAmount, currentPrice)) {
+                            if (activePositions[symbol]) delete activePositions[symbol];
+                            continue;
+                        }
+
+                        trackedSymbolsSet.add(symbol);
 
                         let entryPrice = currentPrice;
                         let entryTime = Date.now();
@@ -585,10 +615,7 @@ async function runBotLoop() {
                         const isStopLossHit = (profitPercentage <= STOP_LOSS_FAST_CUT_PCT || isLiveFlashCrash);
                         const isTpValid = profitPercentage >= vInfo.dynamicTpGrossPct;
 
-                        console.log(`[Wallet 5m] ${symbol} | PnL: ${profitPercentage.toFixed(2)}% | Picco: +${peakProfitPct.toFixed(2)}% | Take Profit: +${vInfo.dynamicTpGrossPct}% | Candele: ${candlesElapsed}/${MAX_CANDLES_WINDOW} (${minutesOpen.toFixed(0)}m)`);
-
-                        const freeCoinAmount = balance.free[rawCurrency] || balance.free[cleanCurrency] || balance.free[`X${cleanCurrency}`] || balance.free[`Z${cleanCurrency}`] || 0;
-                        if (freeCoinAmount <= 0.0001) continue;
+                        console.log(`[Wallet 5m] ${symbol} (€${(freeCoinAmount * currentPrice).toFixed(2)}) | PnL: ${profitPercentage.toFixed(2)}% | Picco: +${peakProfitPct.toFixed(2)}% | Take Profit: +${vInfo.dynamicTpGrossPct}% | Candele: ${candlesElapsed}/${MAX_CANDLES_WINDOW} (${minutesOpen.toFixed(0)}m)`);
 
                         if (isTpValid || isTrailingHit || isVExitHit || isStopLossHit || isWindowExpired) {
                             let reasonType = "TAKE PROFIT DINAMICO";
@@ -608,11 +635,19 @@ async function runBotLoop() {
                             delete activePositions[symbol];
                             if (profitPercentage <= STOP_LOSS_FAST_CUT_PCT) {
                                 lastBuyTimestamp = Date.now();
+                                stoppedSymbolsCooldown[symbol] = Date.now() + SYMBOL_STOP_COOLDOWN_MS;
                             }
                             await new Promise(resolve => setTimeout(resolve, 3000));
                         }
                     } catch (errPort) {
                         console.log(`Errore asset ${symbol}:`, errPort.message);
+                    }
+                }
+
+                // Pulisce eventuali chiavi in activePositions che non sono più posizioni attive significative
+                for (const keySym of Object.keys(activePositions)) {
+                    if (!trackedSymbolsSet.has(keySym)) {
+                        delete activePositions[keySym];
                     }
                 }
 
@@ -691,15 +726,28 @@ async function runBotLoop() {
                     try {
                         if (!exchange.markets[symbol]) continue;
 
-                        const baseCurrency = symbol.split('/')[0];
-                        if (balance.total[baseCurrency] && balance.total[baseCurrency] > 0.0001) continue;
-                        const rawKey = Object.keys(balance.total).find(k => k.includes(baseCurrency));
-                        if (rawKey && balance.total[rawKey] > 0.0001) continue;
+                        // Salta coppia se è in cooldown dopo uno stop loss recente
+                        if (stoppedSymbolsCooldown[symbol] && Date.now() < stoppedSymbolsCooldown[symbol]) {
+                            continue;
+                        }
 
                         const ohlcv5m = await exchange.fetchOHLCV(symbol, TIMEFRAME_ENTRY, undefined, 25);
                         if (!ohlcv5m || ohlcv5m.length < 22) continue;
 
                         const currentPrice = ohlcv5m[ohlcv5m.length - 1][4];
+
+                        // Salta se abbiamo già una posizione rilevante (non residuo/polvere) su questa coin
+                        const baseCurrency = symbol.split('/')[0];
+                        const matchingKeys = Object.keys(totalBalances).filter(k => {
+                            let clean = k.replace(/^[XZ]/, '');
+                            if (clean === 'XBT') clean = 'BTC';
+                            return clean === baseCurrency;
+                        });
+                        const existingTotalAmt = matchingKeys.reduce((sum, k) => sum + (totalBalances[k] || 0), 0);
+                        if (isMeaningfulHolding(existingTotalAmt, currentPrice)) {
+                            continue;
+                        }
+
                         const isDailyWinnerOversold = dailyWinnersSet.has(symbol);
 
                         const reboundTrack = trackPriceAndEvaluateRebound(symbol, currentPrice);
