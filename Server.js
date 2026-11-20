@@ -17,14 +17,16 @@ const exchange = new ccxt.kraken({
 });
 
 let botRunning = true;
-let lastLog = "Bot avviato: Livelli BTC + Termometro Severo + Rimbalzi 5m + Take Profit Dinamico (10€).";
+let lastLog = "Bot avviato: Tracciamento Prezzi + Filtro Probabilità Target + Termometro BTC Severo (10€).";
 let focusedHotPool = [];
 let dailyWinnersSet = new Set();
 let lastHotPoolUpdate = 0;
 global.lastBtcLivePrice = 0;
 
 let activePositions = {};
+let priceTracker = {}; // Traccia storico prezzi, minimi/massimi osservati e trend locale per simbolo
 let btcLockedUntil = 0;
+let lastBuyTimestamp = 0;
 
 const stablecoinsToIgnore = ['USDC', 'EURC', 'USDT', 'DAI', 'PYUSD', 'ZEUR', 'KFEE', 'EUR', 'ZUSD'];
 
@@ -49,13 +51,17 @@ const TRAILING_FLOOR_GROSS_PCT = 0.25;        // Protezione minima sopra le fee 
 const TRAILING_PULLBACK_PCT = 0.45;           // Chiude se scende di 0.45% dal picco raggiunto
 const STOP_LOSS_FAST_CUT_PCT = -1.0;          // Fast-cut / stop loss
 
+// Certezza in ingresso & tracciamento prezzi
+const MIN_ENTRY_SCORE_5M = 7.2;               // Soglia più alta per ridurre ingressi incerti
+const MIN_UPSIDE_ROOM_GROSS_PCT = 1.35;       // Chiede spazio potenziale verso resistenza/banda superiore almeno del 1.35%
+const BUY_COOLDOWN_MS = 15 * 60 * 1000;       // Almeno 15 minuti tra un acquisto e il successivo
+
 // Termometro BTC SEVERO + Livelli
 const BTC_FLASH_CRASH_DROP_RATIO = 0.990;     // -1.0% tra due letture live
 const BTC_MAX_DROP_1H_PERCENT = -0.5;        // Blocca se BTC scende oltre -0.5% nell'ultima ora
 const BTC_MAX_DROP_3H_PERCENT = -1.0;        // Blocca se BTC scende oltre -1.0% in 3 ore
 const BTC_MAX_DROP_15M_4C_PERCENT = -0.6;    // Blocca se BTC scende oltre -0.6% nelle ultime 4 candele da 15m (1h)
 const BTC_LOCK_DURATION_MS = 20 * 60 * 1000;  // Mantiene il blocco almeno 20 minuti quando scatta
-const MIN_ENTRY_SCORE_5M = 6.0;
 
 app.get('/', (req, res) => {
     res.send(`
@@ -104,6 +110,96 @@ function calculateBollingerBands(closes, period = 20, stdDevMultiplier = 2) {
     return { upper, middle, lower };
 }
 
+// TRACCIAMENTO PREZZI CICLO DOPO CICLO: verifica se il prezzo ha fermato la discesa e sta risalendo
+function trackPriceAndEvaluateRebound(symbol, currentPrice) {
+    const now = Date.now();
+    if (!priceTracker[symbol]) {
+        priceTracker[symbol] = {
+            samples: [{ price: currentPrice, ts: now }],
+            trackedLow: currentPrice,
+            trackedHigh: currentPrice
+        };
+        return {
+            samplesCount: 1,
+            reboundFromTrackedLowPct: 0,
+            isTrackedReboundValid: false,
+            reason: "Primo campione tracciato"
+        };
+    }
+
+    const tracker = priceTracker[symbol];
+    const lastSample = tracker.samples[tracker.samples.length - 1];
+
+    // Registra un nuovo campione se cambia prezzo o se sono passati almeno 20s
+    if (!lastSample || lastSample.price !== currentPrice || (now - lastSample.ts) >= 20000) {
+        tracker.samples.push({ price: currentPrice, ts: now });
+        if (tracker.samples.length > 20) {
+            tracker.samples.shift();
+        }
+    }
+
+    if (currentPrice < tracker.trackedLow) {
+        tracker.trackedLow = currentPrice;
+        tracker.trackedHigh = currentPrice;
+    } else if (currentPrice > tracker.trackedHigh) {
+        tracker.trackedHigh = currentPrice;
+    }
+
+    // Se il prezzo ha fatto un nuovo minimo recente troppo fresco (< 45s fa), non ha ancora dimostrato tenuta
+    const lowestSample = tracker.samples.reduce((minS, s) => s.price < minS.price ? s : minS, tracker.samples[0]);
+    const ageSinceLowestSec = (now - lowestSample.ts) / 1000;
+
+    const reboundFromTrackedLowPct = tracker.trackedLow > 0
+        ? ((currentPrice - tracker.trackedLow) / tracker.trackedLow) * 100
+        : 0;
+
+    // Rebound tracciato valido: almeno 3 campioni osservati, minimo formato da almeno 45s, prezzo sopra il minimo tracciato e in risalita rispetto all'ultimo campione
+    const isRisingNow = tracker.samples.length >= 2 && currentPrice >= tracker.samples[tracker.samples.length - 2].price;
+    const isTrackedReboundValid =
+        tracker.samples.length >= 3 &&
+        ageSinceLowestSec >= 45 &&
+        reboundFromTrackedLowPct >= 0.20 &&
+        reboundFromTrackedLowPct <= 1.60 &&
+        isRisingNow;
+
+    return {
+        samplesCount: tracker.samples.length,
+        reboundFromTrackedLowPct,
+        isTrackedReboundValid,
+        reason: isTrackedReboundValid
+            ? `Tracciato +${reboundFromTrackedLowPct.toFixed(2)}% dal minimo (${ageSinceLowestSec.toFixed(0)}s)`
+            : `In attesa conferma tracciamento (min ${ageSinceLowestSec.toFixed(0)}s, +${reboundFromTrackedLowPct.toFixed(2)}%)`
+    };
+}
+
+// STIMA SPAZIO E PROBABILITÀ DI ARRIVARE A TAKE PROFIT
+function evaluateProfitPotential(ohlcv5m, currentPrice, expectedTpGrossPct) {
+    if (!ohlcv5m || ohlcv5m.length < 15 || currentPrice <= 0) {
+        return { hasRoom: false, upsidePct: 0, reason: "Dati insufficienti per spazio target" };
+    }
+
+    const highs = ohlcv5m.map(c => c[2]);
+    const closes = ohlcv5m.map(c => c[4]);
+    const bollinger = calculateBollingerBands(closes);
+
+    const recentHigh = Math.max(...highs.slice(-15, -1));
+    const roomToHighPct = recentHigh > currentPrice ? ((recentHigh - currentPrice) / currentPrice) * 100 : 0;
+    const roomToUpperBandPct = bollinger.upper > currentPrice ? ((bollinger.upper - currentPrice) / currentPrice) * 100 : 0;
+
+    // Spazio realistico stimato: non deve essere già schiacciato contro il massimo locale o la banda superiore
+    const effectiveRoomPct = Math.max(roomToHighPct, roomToUpperBandPct);
+    const requiredRoomPct = Math.max(MIN_UPSIDE_ROOM_GROSS_PCT, expectedTpGrossPct * 0.95);
+    const hasRoom = effectiveRoomPct >= requiredRoomPct;
+
+    return {
+        hasRoom,
+        upsidePct: effectiveRoomPct,
+        reason: hasRoom
+            ? `Spazio stimato +${effectiveRoomPct.toFixed(2)}% (target ~+${expectedTpGrossPct.toFixed(2)}%)`
+            : `Spazio insufficiente (+${effectiveRoomPct.toFixed(2)}% < +${requiredRoomPct.toFixed(2)}%)`
+    };
+}
+
 // FILTRO NOTIZIE E SENTIMENT GLOBALE TRAMITE COINMARKETCAP
 async function checkLiveNewsAndSentiment() {
     try {
@@ -139,7 +235,6 @@ function analyzeBtcLevels(ohlcv15m, currentPrice) {
     const lows = ohlcv15m.map(c => c[3]);
     const closes = ohlcv15m.map(c => c[4]);
 
-    // Escludiamo le ultime 2 candele dal calcolo del supporto storico per trovare il pavimento precedente
     const historicalLows = lows.slice(-20, -2);
     const recentSupport = historicalLows.length > 0 ? Math.min(...historicalLows) : Math.min(...lows);
 
@@ -154,10 +249,7 @@ function analyzeBtcLevels(ohlcv15m, currentPrice) {
     const effectivePrice = currentPrice > 0 ? currentPrice : lastClose;
     const distToSupportPct = recentSupport > 0 ? ((effectivePrice - recentSupport) / recentSupport) * 100 : 0;
 
-    // Supporto rotto se chiude sotto il supporto con margine > 0.35%
     const supportBroken = recentSupport > 0 && lastClose < (recentSupport * 0.9965);
-
-    // Frenata / non-affondo: non sta facendo nuovi minimi peggiori del minimo precedente e non chiude sotto il supporto
     const noFreshBreakdown = !supportBroken && (lastLow >= prevLow * 0.999 || lastClose >= prevClose);
 
     const levelSummary = `Supp €${recentSupport.toFixed(0)} (${distToSupportPct >= 0 ? '+' : ''}${distToSupportPct.toFixed(2)}%) | Res €${recentResistance.toFixed(0)} | ${supportBroken ? 'ROTTURA SUPP' : (noFreshBreakdown ? 'FRENATA/TENUTA' : 'SPINTA GIÙ')}`;
@@ -251,7 +343,6 @@ async function evaluateBtcThermometer() {
         }
     } catch (e15) {}
 
-    // Il termometro resta severo: non sblocca mai solo per il tocco di un livello se il lock o il calo è attivo
     if (isLiveFlashCrash) {
         isBtcHealthy = false;
         blockReason = blockReason || "Flash Crash live";
@@ -330,8 +421,8 @@ function evaluateVStructureAndTp(ohlcv5m, isBtcHealthy, isDailyWinner) {
     return { isVShape, vDepthPct, vReboundPct, vExhausted, dynamicTpGrossPct };
 }
 
-// VALUTAZIONE TECNICA SU 5M PER RIMBALZI VELOCI
-function evaluateTechnicalScore5m(ohlcv, isDailyWinnerOversold = false) {
+// VALUTAZIONE TECNICA SELETTIVA SU 5M + TRACCIAMENTO PREZZI
+function evaluateTechnicalScore5m(ohlcv, isDailyWinnerOversold = false, reboundTrack = null, roomEval = null) {
     if (!ohlcv || ohlcv.length < 22) return { score: 0, details: "Dati insufficienti" };
 
     const closes = ohlcv.map(c => c[4]);
@@ -353,32 +444,46 @@ function evaluateTechnicalScore5m(ohlcv, isDailyWinnerOversold = false) {
 
     const isGreenReaction = (currentClose > prevClose) && (currentClose >= currentOpen);
     const recentLow = Math.min(...lows.slice(-10, -2));
-    const testedSupportAndReacted = (prevLow <= recentLow * 1.006) && isGreenReaction;
-    const lowerBollingerReaction = (prevLow <= bollinger.lower * 1.006) && isGreenReaction;
+    const testedSupportAndReacted = (prevLow <= recentLow * 1.005) && isGreenReaction;
+    const lowerBollingerReaction = (prevLow <= bollinger.lower * 1.005) && isGreenReaction;
 
     if (testedSupportAndReacted || lowerBollingerReaction) {
         score += 3.5;
         reasons.push("Rimbalzo 5m su Supporto/Bollinger");
     } else {
-        score -= 2.0;
+        score -= 2.5;
     }
 
-    if (isDailyWinnerOversold && rsi <= 46 && rsi > prevRsi && isGreenReaction) {
-        score += 2.5;
-        reasons.push(`Vincenti Giornata in Rimbalzo 5m (RSI ${prevRsi.toFixed(1)} -> ${rsi.toFixed(1)})`);
-    } else if (rsi >= 32 && rsi <= 62 && rsi > prevRsi + 0.8) {
+    if (isDailyWinnerOversold && rsi <= 45 && rsi > prevRsi && isGreenReaction) {
         score += 2.0;
-        reasons.push(`RSI 5m in Risalita (${prevRsi.toFixed(1)} -> ${rsi.toFixed(1)})`);
+        reasons.push(`Vincenti Giornata in Rimbalzo 5m (RSI ${prevRsi.toFixed(1)} -> ${rsi.toFixed(1)})`);
+    } else if (rsi >= 33 && rsi <= 57 && rsi > prevRsi + 1.0) {
+        score += 2.0;
+        reasons.push(`RSI 5m in Girata (${prevRsi.toFixed(1)} -> ${rsi.toFixed(1)})`);
     }
 
     const avgVolume = volumes.slice(-7, -1).reduce((a, b) => a + b, 0) / 6;
     const lastVolume = volumes[volumes.length - 1];
 
-    if (lastVolume > avgVolume * 1.25 && isGreenReaction) {
-        score += 2.5;
+    if (lastVolume > avgVolume * 1.3 && isGreenReaction) {
+        score += 2.0;
         reasons.push("Volumi 5m in Spinta");
-    } else if (lastVolume < avgVolume * 0.85) {
-        score -= 1.5;
+    } else if (lastVolume < avgVolume * 0.9) {
+        score -= 2.0;
+    }
+
+    if (reboundTrack && reboundTrack.isTrackedReboundValid) {
+        score += 1.5;
+        reasons.push(reboundTrack.reason);
+    } else {
+        score -= 2.0;
+    }
+
+    if (roomEval && roomEval.hasRoom) {
+        score += 1.0;
+        reasons.push(roomEval.reason);
+    } else if (roomEval) {
+        score -= 2.5;
     }
 
     return { score, details: reasons.join(" + ") };
@@ -501,6 +606,9 @@ async function runBotLoop() {
                             lastLog = `Chiuso ${symbol} (${reasonType}) - PnL: ${profitPercentage.toFixed(2)}%`;
 
                             delete activePositions[symbol];
+                            if (profitPercentage <= STOP_LOSS_FAST_CUT_PCT) {
+                                lastBuyTimestamp = Date.now();
+                            }
                             await new Promise(resolve => setTimeout(resolve, 3000));
                         }
                     } catch (errPort) {
@@ -571,7 +679,14 @@ async function runBotLoop() {
                     continue;
                 }
 
-                // 4. SCANNER SU CANDELA 5M CON IMPORTO A 10€
+                if (Date.now() - lastBuyTimestamp < BUY_COOLDOWN_MS) {
+                    const waitMin = Math.ceil((BUY_COOLDOWN_MS - (Date.now() - lastBuyTimestamp)) / 60000);
+                    console.log(`[Cooldown] In attesa di ${waitMin}m prima di valutare un nuovo ingresso da €${ORDER_SIZE_EUR}.`);
+                    await new Promise(resolve => setTimeout(resolve, 20000));
+                    continue;
+                }
+
+                // 4. SCANNER SU CANDELA 5M CON TRACCIAMENTO PREZZI E VALUTAZIONE SPAZIO TARGET
                 for (const symbol of focusedHotPool) {
                     try {
                         if (!exchange.markets[symbol]) continue;
@@ -582,19 +697,27 @@ async function runBotLoop() {
                         if (rawKey && balance.total[rawKey] > 0.0001) continue;
 
                         const ohlcv5m = await exchange.fetchOHLCV(symbol, TIMEFRAME_ENTRY, undefined, 25);
-                        const isDailyWinnerOversold = dailyWinnersSet.has(symbol);
-                        const techEval = evaluateTechnicalScore5m(ohlcv5m, isDailyWinnerOversold);
+                        if (!ohlcv5m || ohlcv5m.length < 22) continue;
 
-                        if (techEval.score < MIN_ENTRY_SCORE_5M) continue;
+                        const currentPrice = ohlcv5m[ohlcv5m.length - 1][4];
+                        const isDailyWinnerOversold = dailyWinnersSet.has(symbol);
+
+                        const reboundTrack = trackPriceAndEvaluateRebound(symbol, currentPrice);
+                        const vEst = evaluateVStructureAndTp(ohlcv5m, isBtcHealthy, isDailyWinnerOversold);
+                        const roomEval = evaluateProfitPotential(ohlcv5m, currentPrice, vEst.dynamicTpGrossPct);
+                        const techEval = evaluateTechnicalScore5m(ohlcv5m, isDailyWinnerOversold, reboundTrack, roomEval);
+
+                        if (!reboundTrack.isTrackedReboundValid || !roomEval.hasRoom || techEval.score < MIN_ENTRY_SCORE_5M) {
+                            continue;
+                        }
 
                         let targetInvestmentSize = ORDER_SIZE_EUR;
                         if (eurBalance < targetInvestmentSize) targetInvestmentSize = eurBalance;
 
                         if (eurBalance >= ORDER_SIZE_EUR || eurBalance >= 5) {
-                            const currentPrice = ohlcv5m[ohlcv5m.length - 1][4];
                             const amountToBuy = targetInvestmentSize / currentPrice;
 
-                            console.log(`[Tentativo Buy 5m] Ordine da €${targetInvestmentSize} su ${symbol} (Score ${techEval.score}) a €${currentPrice}...`);
+                            console.log(`[Tentativo Buy 5m] Ordine da €${targetInvestmentSize} su ${symbol} (Score ${techEval.score.toFixed(1)}) a €${currentPrice}...`);
 
                             try {
                                 const order = await exchange.createMarketBuyOrder(symbol, amountToBuy);
@@ -605,9 +728,11 @@ async function runBotLoop() {
                                     time: Date.now(),
                                     peakProfitPct: 0
                                 };
+                                lastBuyTimestamp = Date.now();
+                                delete priceTracker[symbol];
 
-                                console.log(`[BUY 5M OK - Score ${techEval.score}] Acquistati €${targetInvestmentSize} di ${symbol} a €${currentPrice.toFixed(4)} | Motivi: ${techEval.details}`);
-                                lastLog = `Acquistati €${targetInvestmentSize} di ${symbol} (5m Score ${techEval.score})`;
+                                console.log(`[BUY 5M OK - Score ${techEval.score.toFixed(1)}] Acquistati €${targetInvestmentSize} di ${symbol} a €${currentPrice.toFixed(4)} | Motivi: ${techEval.details}`);
+                                lastLog = `Acquistati €${targetInvestmentSize} di ${symbol} (5m Score ${techEval.score.toFixed(1)})`;
 
                                 await new Promise(resolve => setTimeout(resolve, 5000));
                                 break;
