@@ -17,7 +17,7 @@ const exchange = new ccxt.kraken({
 });
 
 let botRunning = true;
-let lastLog = "Bot avviato: Versione Completa 5m + Orari Mercati + Macro/Geopolitica + Termometro BTC Severo (10€).";
+let lastLog = "Bot avviato: Termometro BTC Visibile & Severo + 5m + TP Dinamico (10€).";
 let focusedHotPool = [];
 let dailyWinnersSet = new Set();
 let lastHotPoolUpdate = 0;
@@ -122,7 +122,6 @@ function calculateBollingerBands(closes, period = 20, stdDevMultiplier = 2) {
     return { upper, middle, lower };
 }
 
-// Verifica se i mercati tradizionali (USA / commodities) sono aperti in ora italiana (lun-ven, ~15:00-22:30)
 function isTraditionalMarketOpenNow() {
     try {
         const now = new Date();
@@ -143,8 +142,8 @@ function isTraditionalMarketOpenNow() {
         }
 
         const minutesFromMidnight = hour * 60 + minute;
-        const marketStartMin = 15 * 60;       // 15:00 CET/CEST
-        const marketEndMin = 22 * 60 + 30;    // 22:30 CET/CEST
+        const marketStartMin = 15 * 60;
+        const marketEndMin = 22 * 60 + 30;
 
         return minutesFromMidnight >= marketStartMin && minutesFromMidnight <= marketEndMin;
     } catch (e) {
@@ -152,7 +151,6 @@ function isTraditionalMarketOpenNow() {
     }
 }
 
-// Recupera variazione % giornaliera su Yahoo Finance chart endpoint (senza bloccare il bot se offline)
 async function fetchYahooDailyChangePct(tickerSymbol) {
     try {
         const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(tickerSymbol)}?range=2d&interval=15m`;
@@ -173,7 +171,6 @@ async function fetchYahooDailyChangePct(tickerSymbol) {
     }
 }
 
-// FILTRO MACRO & GEOPOLITICO (Nasdaq, S&P 500, Petrolio WTI, Oro — attivo solo nei giorni/orari di mercato aperto)
 async function evaluateMacroAndGeopolitics() {
     if (!isTraditionalMarketOpenNow()) {
         macroLockedUntil = 0;
@@ -217,7 +214,6 @@ async function evaluateMacroAndGeopolitics() {
     return { blocked: false, reason: summaryStr };
 }
 
-// Verifica se un saldo residuo è davvero una posizione rilevante o solo polvere/frazione insignificante
 function isMeaningfulHolding(amount, priceEur) {
     if (!amount || amount <= MIN_COIN_AMOUNT_FLOOR) return false;
     if (priceEur && priceEur > 0) {
@@ -227,7 +223,6 @@ function isMeaningfulHolding(amount, priceEur) {
     return amount >= 0.01;
 }
 
-// TRACCIAMENTO PREZZI CICLO DOPO CICLO: verifica tenuta, almeno 2 passi in risalita e minimo non fresco
 function trackPriceAndEvaluateRebound(symbol, currentPrice) {
     const now = Date.now();
     if (!priceTracker[symbol]) {
@@ -291,7 +286,6 @@ function trackPriceAndEvaluateRebound(symbol, currentPrice) {
     };
 }
 
-// STIMA SPAZIO E PROBABILITÀ DI ARRIVARE A TAKE PROFIT
 function evaluateProfitPotential(ohlcv5m, currentPrice, expectedTpGrossPct) {
     if (!ohlcv5m || ohlcv5m.length < 15 || currentPrice <= 0) {
         return { hasRoom: false, upsidePct: 0, reason: "Dati insufficienti per spazio target" };
@@ -318,7 +312,6 @@ function evaluateProfitPotential(ohlcv5m, currentPrice, expectedTpGrossPct) {
     };
 }
 
-// FILTRO NOTIZIE E SENTIMENT GLOBALE TRAMITE COINMARKETCAP
 async function checkLiveNewsAndSentiment() {
     try {
         if (CMC_API_KEY) {
@@ -336,7 +329,6 @@ async function checkLiveNewsAndSentiment() {
     }
 }
 
-// ANALISI LIVELLI BTC (Supporto recente, rottura supporto, resistenza locale e frenata)
 function analyzeBtcLevels(ohlcv15m, currentPrice) {
     if (!ohlcv15m || ohlcv15m.length < 12) {
         return {
@@ -382,7 +374,6 @@ function analyzeBtcLevels(ohlcv15m, currentPrice) {
     };
 }
 
-// TERMOMETRO BTC SEVERO CON ISTERESI LUNGA + LETTURA LIVELLI
 async function evaluateBtcThermometer() {
     let isLiveFlashCrash = false;
     let isBtcHealthy = true;
@@ -391,6 +382,7 @@ async function evaluateBtcThermometer() {
     let btcChange15m4c = 0;
     let blockReason = "";
     let btcCurrentLivePrice = 0;
+    let dataFetchOk = true;
 
     try {
         const btcTicker = await exchange.fetchTicker('BTC/EUR');
@@ -402,7 +394,10 @@ async function evaluateBtcThermometer() {
             blockReason = "Flash Crash live";
         }
         global.lastBtcLivePrice = btcCurrentLivePrice;
-    } catch (e) {}
+    } catch (e) {
+        dataFetchOk = false;
+        console.log(`[Termometro BTC] Errore lettura ticker BTC/EUR: ${e.message}`);
+    }
 
     let isStillDropping = false;
 
@@ -428,8 +423,13 @@ async function evaluateBtcThermometer() {
                 btcLockedUntil = Date.now() + BTC_LOCK_DURATION_MS;
                 blockReason = `BTC in discesa su 1h (${btcChange1h.toFixed(2)}%)`;
             }
+        } else {
+            dataFetchOk = false;
         }
-    } catch (btcErr) {}
+    } catch (btcErr) {
+        dataFetchOk = false;
+        console.log(`[Termometro BTC] Errore lettura OHLCV 1h: ${btcErr.message}`);
+    }
 
     let levelInfo = {
         recentSupport: 0,
@@ -458,10 +458,18 @@ async function evaluateBtcThermometer() {
                 btcLockedUntil = Date.now() + BTC_LOCK_DURATION_MS;
                 blockReason = blockReason || `Supporto BTC €${levelInfo.recentSupport.toFixed(0)} rotto`;
             }
+        } else {
+            dataFetchOk = false;
         }
-    } catch (e15) {}
+    } catch (e15) {
+        dataFetchOk = false;
+        console.log(`[Termometro BTC] Errore lettura OHLCV 15m: ${e15.message}`);
+    }
 
-    if (isLiveFlashCrash) {
+    if (!dataFetchOk) {
+        isBtcHealthy = false;
+        blockReason = blockReason || "Lettura dati BTC incompleta (blocco prudenziale)";
+    } else if (isLiveFlashCrash) {
         isBtcHealthy = false;
         blockReason = blockReason || "Flash Crash live";
     } else if (
@@ -492,10 +500,12 @@ async function evaluateBtcThermometer() {
         }
     }
 
+    const statusTag = isBtcHealthy ? "OK" : `BLOCCATO (${blockReason})`;
+    console.log(`[Termometro BTC] ${statusTag} | Prezzo: €${btcCurrentLivePrice ? btcCurrentLivePrice.toFixed(0) : 'N/D'} | 1h: ${btcChange1h.toFixed(2)}%, 3h: ${btcChange3h.toFixed(2)}%, 15m/4c: ${btcChange15m4c.toFixed(2)}% | ${levelInfo.levelSummary}`);
+
     return { isLiveFlashCrash, isBtcHealthy, btcChange1h, btcChange3h, btcChange15m4c, blockReason, levelInfo };
 }
 
-// VALUTA STRUTTURA A V E CALCOLA TAKE PROFIT DINAMICO
 function evaluateVStructureAndTp(ohlcv5m, isBtcHealthy, isDailyWinner) {
     let vDepthPct = 0;
     let vReboundPct = 0;
@@ -539,7 +549,6 @@ function evaluateVStructureAndTp(ohlcv5m, isBtcHealthy, isDailyWinner) {
     return { isVShape, vDepthPct, vReboundPct, vExhausted, dynamicTpGrossPct };
 }
 
-// VALUTAZIONE TECNICA SELETTIVA SU 5M + TRACCIAMENTO PREZZI
 function evaluateTechnicalScore5m(ohlcv, isDailyWinnerOversold = false, reboundTrack = null, roomEval = null) {
     if (!ohlcv || ohlcv.length < 22) return { score: 0, details: "Dati insufficienti" };
 
