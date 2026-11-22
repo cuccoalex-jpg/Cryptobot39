@@ -17,7 +17,7 @@ const exchange = new ccxt.kraken({
 });
 
 let botRunning = true;
-let lastLog = "Bot avviato: Logica Giornaliera / Cambio Fase BTC + Posizione nella Giornata (10€).";
+let lastLog = "Bot avviato: Tempo Illimitato fino a TP/Stop + Termometro BTC Fibonacci & Weekend (10€).";
 let focusedHotPool = [];
 let dailyWinnersSet = new Set();
 let lastHotPoolUpdate = 0;
@@ -38,21 +38,28 @@ const customWatchlistSymbols = [
     'UNI/EUR', 'ENA/EUR'
 ];
 
-// Parametri Operativi Giornalieri / Intraday
+// Parametri Operativi (tempo di apertura ILLIMITATO fino a TP, trailing, rallentamento o stop loss / fast cut)
 const ORDER_SIZE_EUR = 10;
 const TIMEFRAME_ENTRY = '5m';
 const TIMEFRAME_STRUCTURE = '1h';
-const MAX_HOLD_MINUTES = 180;                 // Fino a 3 ore per seguire una svolta intraday/giornaliera
 const ESTIMATED_ROUNDTRIP_FEE_PCT = 0.50;
 
-// Uscite elastiche legate alla forza del movimento giornaliero
-const MIN_TP_NET_PCT = 1.10;                  // ~1.60% lordo minimo quando il movimento è corto
+// Uscite elastiche con allargamento calcolato e paracadute se si ferma prima del TP esteso
+const MIN_TP_NET_PCT = 1.10;                  // ~1.60% lordo minimo quando lo spazio è corto
 const BASE_TP_NET_PCT = 1.80;                 // ~2.30% lordo target base su cambio di fase
-const MAX_DYNAMIC_TP_NET_PCT = 4.20;          // Fino a ~4.70% lordo se spinge con forza nella giornata
-const TRAILING_ARM_GROSS_PCT = 1.30;          // Arma il trailing sopra +1.30% lordo
-const TRAILING_FLOOR_GROSS_PCT = 0.60;        // Protegge almeno +0.60% lordo una volta armato
-const TRAILING_PULLBACK_PCT = 0.70;           // Lascia respirare il prezzo (0.70% dal picco) prima di chiudere
-const STOP_LOSS_FAST_CUT_PCT = -1.35;         // Invalidazione / stop loss
+const MAX_DYNAMIC_TP_NET_PCT = 4.20;          // Tetto massimo calcolato (~4.70% lordo) se spinta e spazio confermano
+const TRAILING_ARM_GROSS_PCT = 1.25;          // Arma il trailing sopra +1.25% lordo
+const TRAILING_FLOOR_GROSS_PCT = 0.65;        // Protezione minima sopra le fee una volta armato
+const TRAILING_PULLBACK_PCT = 0.65;           // Ritracciamento standard dal picco prima di incassare
+const EXTENDED_GAIN_TRAILING_ARM_PCT = 2.40;  // Sopra +2.40% lordo stringe il paracadute per non restituire il guadagno
+const EXTENDED_GAIN_PULLBACK_PCT = 0.45;      // Margine di ritracciamento dal picco quando è già in forte utile
+const STOP_LOSS_FAST_CUT_PCT = -1.35;         // Stop loss / fast cut di invalidazione
+
+// Order Book: controllo spread, profondità e ordine limite temporizzato sull'ingresso
+const MAX_ALLOWED_SPREAD_PCT = 0.45;          // Blocca se lo spread ask-bid supera lo 0.45%
+const MIN_BOOK_DEPTH_EUR = 150;               // Liquidità minima richiesta nei primi livelli del book (€)
+const LIMIT_FILL_TIMEOUT_MS = 25000;          // Attesa massima per l'esecuzione dell'ordine limite sul book
+const LIMIT_POLL_INTERVAL_MS = 4000;          // Controllo stato ordine limite ogni 4 secondi
 
 // Filtro residui / briciole in portafoglio
 const MIN_TRACKED_POSITION_EUR = 1.50;
@@ -63,7 +70,7 @@ const MIN_DAY_REBOUND_SCORE = 6.5;
 const BUY_COOLDOWN_MS = 12 * 60 * 1000;
 const SYMBOL_STOP_COOLDOWN_MS = 40 * 60 * 1000;
 
-// Macro & Geopolitica (solo mercati tradizionali aperti lun-ven)
+// Macro & Geopolitica (solo mercati tradizionali aperti lun-ven; in weekend / domenica è disattivato)
 const MACRO_INDEX_MAX_DROP_PCT = -1.2;
 const OIL_SHOCK_MAX_SPIKE_PCT = 3.5;
 const MACRO_LOCK_DURATION_MS = 15 * 60 * 1000;
@@ -96,28 +103,269 @@ function isMeaningfulHolding(amount, priceEur) {
     return amount >= 0.01;
 }
 
+function getItalyDayAndMinutes() {
+    const now = new Date();
+    const italyParts = new Intl.DateTimeFormat('en-US', {
+        timeZone: 'Europe/Rome',
+        weekday: 'short',
+        hour: '2-digit',
+        minute: '2-digit',
+        hour12: false
+    }).formatToParts(now);
+
+    const weekday = italyParts.find(p => p.type === 'weekday')?.value || '';
+    const hour = parseInt(italyParts.find(p => p.type === 'hour')?.value || '0', 10);
+    const minute = parseInt(italyParts.find(p => p.type === 'minute')?.value || '0', 10);
+
+    return {
+        weekday,
+        isSunday: weekday === 'Sun',
+        isWeekend: weekday === 'Sat' || weekday === 'Sun',
+        minutesFromMidnight: hour * 60 + minute
+    };
+}
+
 function isTraditionalMarketOpenNow() {
     try {
-        const now = new Date();
-        const italyParts = new Intl.DateTimeFormat('en-US', {
-            timeZone: 'Europe/Rome',
-            weekday: 'short',
-            hour: '2-digit',
-            minute: '2-digit',
-            hour12: false
-        }).formatToParts(now);
-
-        const weekday = italyParts.find(p => p.type === 'weekday')?.value || '';
-        const hour = parseInt(italyParts.find(p => p.type === 'hour')?.value || '0', 10);
-        const minute = parseInt(italyParts.find(p => p.type === 'minute')?.value || '0', 10);
-
-        if (weekday === 'Sat' || weekday === 'Sun') return false;
-
-        const minutesFromMidnight = hour * 60 + minute;
-        return minutesFromMidnight >= (15 * 60) && minutesFromMidnight <= (22 * 60 + 30);
+        const info = getItalyDayAndMinutes();
+        if (info.isWeekend) return false;
+        return info.minutesFromMidnight >= (15 * 60) && info.minutesFromMidnight <= (22 * 60 + 30);
     } catch (e) {
         return false;
     }
+}
+
+// Calcola livelli di ritracciamento Fibonacci tra swingLow e swingHigh (dal basso verso l'alto)
+function calculateFibonacciLevels(swingLow, swingHigh) {
+    const diff = swingHigh - swingLow;
+    if (!swingLow || !swingHigh || diff <= 0) {
+        return null;
+    }
+    return {
+        swingLow,
+        swingHigh,
+        fib0236: swingHigh - diff * 0.236,
+        fib0382: swingHigh - diff * 0.382,
+        fib0500: swingHigh - diff * 0.500,
+        fib0618: swingHigh - diff * 0.618,
+        fib0786: swingHigh - diff * 0.786
+    };
+}
+
+// Legge posizione e reazione di BTC rispetto ai livelli di Fibonacci (con adattamento specifico per la domenica/weekend)
+function analyzeBtcFibonacciStructure(ohlcv1h, livePrice, isSunday) {
+    if (!ohlcv1h || ohlcv1h.length < 16 || !livePrice || livePrice <= 0) {
+        return {
+            fibValid: false,
+            fibAllowsBuys: false,
+            fibBoost: 0,
+            fibSummary: "Fibo N/D"
+        };
+    }
+
+    const windowCandles = isSunday ? ohlcv1h.slice(-36) : ohlcv1h.slice(-24);
+    const swingLow = Math.min(...windowCandles.map(c => c[3]));
+    const swingHigh = Math.max(...windowCandles.map(c => c[2]));
+    const fib = calculateFibonacciLevels(swingLow, swingHigh);
+
+    if (!fib) {
+        return {
+            fibValid: false,
+            fibAllowsBuys: true,
+            fibBoost: 0,
+            fibSummary: "Range Fibo piatto"
+        };
+    }
+
+    const lastCandle = ohlcv1h[ohlcv1h.length - 1];
+    const prevCandle = ohlcv1h[ohlcv1h.length - 2];
+    const candleTurningUp = livePrice >= lastCandle[1] || lastCandle[4] >= prevCandle[4];
+    const breakingDeepFibo = livePrice < fib.fib0786 * 0.997;
+
+    let zoneLabel = "SOPRA 0.236";
+    let fibBoost = 0;
+    let fibAllowsBuys = true;
+
+    if (breakingDeepFibo) {
+        zoneLabel = "ROTTO 0.786 (DEBOLE)";
+        fibAllowsBuys = false;
+        fibBoost = -0.30;
+    } else if (livePrice >= fib.fib0236) {
+        zoneLabel = "ZONA 0.0-0.236 (FORTE)";
+        fibBoost = 0.25;
+    } else if (livePrice >= fib.fib0382) {
+        zoneLabel = "SU FIB 0.382";
+        fibBoost = candleTurningUp ? 0.35 : 0.05;
+    } else if (livePrice >= fib.fib0500) {
+        zoneLabel = "SU FIB 0.50";
+        fibBoost = candleTurningUp ? 0.45 : 0.0;
+    } else if (livePrice >= fib.fib0618) {
+        zoneLabel = "GOLDEN POCKET 0.618";
+        fibBoost = candleTurningUp ? 0.50 : -0.10;
+        if (isSunday && !candleTurningUp) fibAllowsBuys = false;
+    } else {
+        zoneLabel = "SOTTO 0.618 -> 0.786";
+        fibBoost = -0.15;
+        if (isSunday && !candleTurningUp) fibAllowsBuys = false;
+    }
+
+    const fibSummary = `Fib[${zoneLabel} | 0.382:€${fib.fib0382.toFixed(0)} | 0.5:€${fib.fib0500.toFixed(0)} | 0.618:€${fib.fib0618.toFixed(0)} | 0.786:€${fib.fib0786.toFixed(0)}]`;
+    return {
+        fibValid: true,
+        fibAllowsBuys,
+        fibBoost,
+        fibSummary,
+        levels: fib
+    };
+}
+
+// Punto 1: Lettura order book, controllo spread e profondità per il lato richiesto ('buy' o 'sell')
+async function evaluateOrderBookForExecution(symbol, side = 'buy') {
+    try {
+        const book = await exchange.fetchOrderBook(symbol, 15);
+        const bids = Array.isArray(book?.bids) ? book.bids : [];
+        const asks = Array.isArray(book?.asks) ? book.asks : [];
+
+        if (bids.length === 0 || asks.length === 0) {
+            return { ok: false, reason: "Book vuoto (bid/ask assenti)" };
+        }
+
+        const bestBid = bids[0][0];
+        const bestAsk = asks[0][0];
+        if (!bestBid || !bestAsk || bestBid <= 0 || bestAsk <= 0 || bestAsk < bestBid) {
+            return { ok: false, reason: "Prezzi bid/ask non validi" };
+        }
+
+        const midPrice = (bestBid + bestAsk) / 2;
+        const spreadPct = ((bestAsk - bestBid) / midPrice) * 100;
+
+        if (spreadPct > MAX_ALLOWED_SPREAD_PCT) {
+            return {
+                ok: false,
+                bestBid,
+                bestAsk,
+                spreadPct,
+                reason: `Spread troppo largo (${spreadPct.toFixed(2)}% > ${MAX_ALLOWED_SPREAD_PCT}%)`
+            };
+        }
+
+        const levelsToCheck = side === 'buy' ? asks.slice(0, 10) : bids.slice(0, 10);
+        let depthEur = 0;
+        for (const lvl of levelsToCheck) {
+            const price = lvl[0];
+            const size = lvl[1];
+            if (typeof price === 'number' && typeof size === 'number' && price > 0 && size > 0) {
+                depthEur += price * size;
+            }
+        }
+
+        if (depthEur < MIN_BOOK_DEPTH_EUR) {
+            return {
+                ok: false,
+                bestBid,
+                bestAsk,
+                spreadPct,
+                depthEur,
+                reason: `Profondità book insufficiente lato ${side} (€${depthEur.toFixed(0)} < €${MIN_BOOK_DEPTH_EUR})`
+            };
+        }
+
+        return {
+            ok: true,
+            bestBid,
+            bestAsk,
+            spreadPct,
+            depthEur,
+            reason: `Book OK (spread ${spreadPct.toFixed(2)}%, prof ${side} €${depthEur.toFixed(0)})`
+        };
+    } catch (e) {
+        return { ok: false, reason: `Errore lettura book: ${e.message}` };
+    }
+}
+
+// Punto 2: Ordine limite competitivo sul book con controllo di esecuzione e cancellazione se resta appeso
+async function placeTimedLimitBuyOnBook(symbol, amountToBuy, bookInfo) {
+    const rawLimitPrice = bookInfo && bookInfo.bestBid ? bookInfo.bestBid : 0;
+    if (!rawLimitPrice || rawLimitPrice <= 0) {
+        return { filled: false, reason: "Prezzo bid non disponibile per ordine limite" };
+    }
+
+    const formattedPrice = Number(exchange.priceToPrecision(symbol, rawLimitPrice));
+    const formattedAmount = Number(exchange.amountToPrecision(symbol, amountToBuy));
+
+    if (!formattedPrice || !formattedAmount || formattedAmount <= 0) {
+        return { filled: false, reason: "Quantità o prezzo limite non formattabili" };
+    }
+
+    const order = await exchange.createLimitBuyOrder(symbol, formattedAmount, formattedPrice);
+    const orderId = order?.id;
+    console.log(`[LIMIT BUY INVIATO] ${symbol}: ${formattedAmount} @ €${formattedPrice} (ID: ${orderId || 'N/D'})`);
+
+    if (!orderId) {
+        return { filled: true, execPrice: formattedPrice, amount: formattedAmount, order };
+    }
+
+    const deadline = Date.now() + LIMIT_FILL_TIMEOUT_MS;
+    let filledAmount = 0;
+    let avgPrice = formattedPrice;
+
+    while (Date.now() < deadline) {
+        await new Promise(resolve => setTimeout(resolve, LIMIT_POLL_INTERVAL_MS));
+
+        try {
+            const currentOrder = await exchange.fetchOrder(orderId, symbol);
+            const status = currentOrder?.status;
+            filledAmount = typeof currentOrder?.filled === 'number' ? currentOrder.filled : filledAmount;
+            if (typeof currentOrder?.average === 'number' && currentOrder.average > 0) {
+                avgPrice = currentOrder.average;
+            } else if (typeof currentOrder?.price === 'number' && currentOrder.price > 0) {
+                avgPrice = currentOrder.price;
+            }
+
+            if (status === 'closed' || (filledAmount > 0 && filledAmount >= formattedAmount * 0.995)) {
+                return {
+                    filled: true,
+                    execPrice: avgPrice,
+                    amount: filledAmount > 0 ? filledAmount : formattedAmount,
+                    order: currentOrder
+                };
+            }
+
+            const ticker = await exchange.fetchTicker(symbol);
+            if (ticker && typeof ticker.last === 'number' && ticker.last > formattedPrice * 1.0035) {
+                console.log(`[LIMIT IN RITARDO] Prezzo ${symbol} salito a €${ticker.last} oltre limite €${formattedPrice}, cancello ordine limite.`);
+                break;
+            }
+        } catch (pollErr) {
+            console.log(`[Poll Ordine Limite ${symbol}]: ${pollErr.message}`);
+        }
+    }
+
+    try {
+        await exchange.cancelOrder(orderId, symbol);
+        const afterCancel = await exchange.fetchOrder(orderId, symbol).catch(() => null);
+        const partialFilled = typeof afterCancel?.filled === 'number' ? afterCancel.filled : filledAmount;
+        const partialAvg = (typeof afterCancel?.average === 'number' && afterCancel.average > 0)
+            ? afterCancel.average
+            : avgPrice;
+
+        if (partialFilled > 0 && (partialFilled * partialAvg) >= MIN_TRACKED_POSITION_EUR) {
+            return {
+                filled: true,
+                partial: true,
+                execPrice: partialAvg,
+                amount: partialFilled,
+                order: afterCancel
+            };
+        }
+    } catch (cancelErr) {
+        console.log(`[Cancel Ordine Limite ${symbol}]: ${cancelErr.message}`);
+    }
+
+    return {
+        filled: false,
+        reason: `Ordine limite non eseguito entro ${Math.round(LIMIT_FILL_TIMEOUT_MS / 1000)}s (annullato)`
+    };
 }
 
 async function fetchYahooDailyChangePct(tickerSymbol) {
@@ -143,7 +391,7 @@ async function fetchYahooDailyChangePct(tickerSymbol) {
 async function evaluateMacroAndGeopolitics() {
     if (!isTraditionalMarketOpenNow()) {
         macroLockedUntil = 0;
-        return { blocked: false, reason: "Mercati tradizionali chiusi" };
+        return { blocked: false, reason: "Mercati tradizionali chiusi (weekend / domenica)" };
     }
 
     if (Date.now() < macroLockedUntil) {
@@ -173,8 +421,12 @@ async function evaluateMacroAndGeopolitics() {
     return { blocked: false, reason: "OK" };
 }
 
-// ANALIZZA LA GIORNATA / CAMBIO DI FASE DI BTC (es. dopo uno short/discesa, cerca tenuta del minimo e svolta)
+// TERMOMETRO BTC: struttura giornaliera/1h + ritracciamento Fibonacci + modalità domenica
 async function evaluateBtcDailyRegime() {
+    const dayInfo = getItalyDayAndMinutes();
+    const isSunday = dayInfo.isSunday;
+    const minReboundRequired = isSunday ? 0.25 : 0.35;
+
     try {
         const ticker = await exchange.fetchTicker('BTC/EUR');
         const livePrice = ticker.last;
@@ -184,14 +436,16 @@ async function evaluateBtcDailyRegime() {
                 allowAltBuys: false,
                 regime: "CRASH_LIVE",
                 btcChange24hPct: 0,
+                fibBoost: 0,
+                isSunday,
                 summary: `Crollo live BTC a €${livePrice.toFixed(0)}`
             };
         }
         global.lastBtcLivePrice = livePrice;
 
-        const ohlcv1h = await exchange.fetchOHLCV('BTC/EUR', TIMEFRAME_STRUCTURE, undefined, 30);
+        const ohlcv1h = await exchange.fetchOHLCV('BTC/EUR', TIMEFRAME_STRUCTURE, undefined, 40);
         if (!ohlcv1h || ohlcv1h.length < 12) {
-            return { allowAltBuys: false, regime: "NO_DATA", btcChange24hPct: 0, summary: "Dati 1h BTC insufficienti" };
+            return { allowAltBuys: false, regime: "NO_DATA", btcChange24hPct: 0, fibBoost: 0, isSunday, summary: "Dati 1h BTC insufficienti" };
         }
 
         const last24h = ohlcv1h.slice(-24);
@@ -207,49 +461,59 @@ async function evaluateBtcDailyRegime() {
         const reboundFromDayLowPct = dayLow > 0 ? ((livePrice - dayLow) / dayLow) * 100 : 0;
         const recentDropBeforeLowPct = dayHigh > 0 ? ((dayHigh - dayLow) / dayHigh) * 100 : 0;
 
-        // Sta ancora facendo nuovi minimi o scendendo pesantemente senza fermarsi?
         const makingFreshBreakdown = (lastCandle[3] < prevCandle[3] * 0.997) && (lastCandle[4] < prevCandle[4]);
         const heavyFreefall = ((lastCandle[4] - threeCandlesAgo[1]) / threeCandlesAgo[1]) * 100 < -1.4;
 
-        // Cambio di fase / tenuta dopo discesa: ha stornato nelle 24h ma ora tiene sopra il minimo di giornata e sta rimbalzando/girando
+        const fibAnalysis = analyzeBtcFibonacciStructure(ohlcv1h, livePrice, isSunday);
+
         const isReversalOrReboundPhase =
             !makingFreshBreakdown &&
             !heavyFreefall &&
-            reboundFromDayLowPct >= 0.35 &&
+            fibAnalysis.fibAllowsBuys &&
+            reboundFromDayLowPct >= minReboundRequired &&
             (lastCandle[4] >= prevCandle[4] || btcChange24hPct > -2.5);
 
+        const dayTag = isSunday ? "DOMENICA_FIB" : "STRUTTURA_FIB";
         const regime = isReversalOrReboundPhase
             ? (recentDropBeforeLowPct >= 1.5 ? "CAMBIO_FASE_DOPO_SCARICO" : "SPINTA_GIORNALIERA")
             : "PRESSIONE_RIBASSISTA";
 
-        const summary = `${regime} | Prezzo €${livePrice.toFixed(0)} | 24h ${btcChange24hPct >= 0 ? '+' : ''}${btcChange24hPct.toFixed(2)}% | Min24h €${dayLow.toFixed(0)} (+${reboundFromDayLowPct.toFixed(2)}%) | Max24h €${dayHigh.toFixed(0)}`;
-        console.log(`[Regime BTC] ${isReversalOrReboundPhase ? 'OK' : 'STOP'} | ${summary}`);
+        const summary = `${dayTag}/${regime} | Prezzo €${livePrice.toFixed(0)} | 24h ${btcChange24hPct >= 0 ? '+' : ''}${btcChange24hPct.toFixed(2)}% | Min24h €${dayLow.toFixed(0)} (+${reboundFromDayLowPct.toFixed(2)}%) | Max24h €${dayHigh.toFixed(0)} | ${fibAnalysis.fibSummary}`;
+        console.log(`[Termometro BTC] ${isReversalOrReboundPhase ? 'OK' : 'STOP'} | ${summary}`);
 
         return {
             allowAltBuys: isReversalOrReboundPhase,
             regime,
             btcChange24hPct,
+            fibBoost: fibAnalysis.fibBoost,
+            isSunday,
             summary
         };
     } catch (e) {
-        console.log(`[Regime BTC] Errore lettura: ${e.message}`);
-        return { allowAltBuys: false, regime: "ERRORE", btcChange24hPct: 0, summary: "Errore dati BTC" };
+        console.log(`[Termometro BTC] Errore lettura: ${e.message}`);
+        return { allowAltBuys: false, regime: "ERRORE", btcChange24hPct: 0, fibBoost: 0, isSunday, summary: "Errore dati BTC" };
     }
 }
 
-// VALUTA LA POSIZIONE DELLA SINGOLA ALTCOIN NELLA GIORNATA + SE STA GIRANDO SUL MINIMO
+// VALUTA LA POSIZIONE NELLA GIORNATA, IL SETUP E L'ALLARGAMENTO CALCOLATO DEL TP + SEGNALE DI ESAURIMENTO SPINTA
 function evaluateAltDailySetup(ohlcv5m, ohlcv1h, isDailyWinner, btcRegime) {
     if (!ohlcv5m || ohlcv5m.length < 24 || !ohlcv1h || ohlcv1h.length < 12) {
-        return { valid: false, score: 0, dynamicTpGrossPct: Number((BASE_TP_NET_PCT + ESTIMATED_ROUNDTRIP_FEE_PCT).toFixed(2)), reason: "Dati insufficienti" };
+        return {
+            valid: false,
+            score: 0,
+            dynamicTpGrossPct: Number((BASE_TP_NET_PCT + ESTIMATED_ROUNDTRIP_FEE_PCT).toFixed(2)),
+            momentumFading: false,
+            reason: "Dati insufficienti"
+        };
     }
 
     const closes5m = ohlcv5m.map(c => c[4]);
     const lows5m = ohlcv5m.map(c => c[3]);
-    const highs5m = ohlcv5m.map(c => c[2]);
     const vols5m = ohlcv5m.map(c => c[5]);
 
     const currentPrice = closes5m[closes5m.length - 1];
     const prevClose = closes5m[closes5m.length - 2];
+    const prevPrevClose = closes5m[closes5m.length - 3];
 
     const last24h1h = ohlcv1h.slice(-24);
     const dayLow = Math.min(...last24h1h.map(c => c[3]));
@@ -257,17 +521,14 @@ function evaluateAltDailySetup(ohlcv5m, ohlcv1h, isDailyWinner, btcRegime) {
     const dayOpen = last24h1h[0][1];
     const dayChangePct = dayOpen > 0 ? ((currentPrice - dayOpen) / dayOpen) * 100 : 0;
 
-    // Dove si trova il prezzo tra minimo e massimo delle 24h (0 = sul minimo, 1 = sul massimo)
     const range24h = dayHigh - dayLow;
     const positionInDayRange = range24h > 0 ? (currentPrice - dayLow) / range24h : 0.5;
     const reboundFromDayLowPct = dayLow > 0 ? ((currentPrice - dayLow) / dayLow) * 100 : 0;
     const upsideRoomToDayHighPct = currentPrice > 0 ? ((dayHigh - currentPrice) / currentPrice) * 100 : 0;
 
-    // Minimo locale recente su 5m (ultime 18 candele = 90 min) e tenuta sopra di esso
     const recentLow5m = Math.min(...lows5m.slice(-18, -2));
     const holdingAboveLocalLow = currentPrice > recentLow5m * 1.002 && lows5m[lows5m.length - 1] >= recentLow5m * 0.998;
 
-    // Volumi e candele recenti sul 5m: cerca conferma che non stia più scaricando ma stia girando/rimbalzando
     const avgVol = vols5m.slice(-8, -1).reduce((a, b) => a + b, 0) / 7;
     const lastVol = vols5m[vols5m.length - 1];
     const greenCandlesLast4 = [
@@ -277,10 +538,9 @@ function evaluateAltDailySetup(ohlcv5m, ohlcv1h, isDailyWinner, btcRegime) {
         closes5m[closes5m.length - 4] > closes5m[closes5m.length - 5]
     ].filter(Boolean).length;
 
-    let score = 0;
+    let score = btcRegime.fibBoost || 0;
     const reasons = [];
 
-    // 1. Posizione nella giornata: favorisce zone basse/medie della giornata con spazio verso il massimo giornaliero
     if (positionInDayRange <= 0.65 && upsideRoomToDayHighPct >= 1.4) {
         score += 3.0;
         reasons.push(`Zona favorevole giornata (spazio max +${upsideRoomToDayHighPct.toFixed(1)}%)`);
@@ -289,48 +549,62 @@ function evaluateAltDailySetup(ohlcv5m, ohlcv1h, isDailyWinner, btcRegime) {
         reasons.push("Troppo vicina al massimo di giornata");
     }
 
-    // 2. Reazione / rimbalzo dal minimo di giornata o minimo locale 5m
     if (holdingAboveLocalLow && reboundFromDayLowPct >= 0.4) {
         score += 2.5;
         reasons.push(`Tiene sopra minimo (+${reboundFromDayLowPct.toFixed(1)}% da min24h)`);
     }
 
-    // 3. Cambio di marcia sulle ultime candele 5m
     if (greenCandlesLast4 >= 2 && currentPrice >= prevClose) {
         score += 2.0;
         reasons.push(`Svolta 5m (${greenCandlesLast4}/4 verdi)`);
     }
 
-    // 4. Forza giornaliera / vincente di giornata
     if (isDailyWinner || dayChangePct > 1.5) {
         score += 1.5;
         reasons.push(`Forza giornaliera (${dayChangePct >= 0 ? '+' : ''}${dayChangePct.toFixed(1)}%)`);
     }
 
-    // 5. Volumi a supporto
     if (avgVol > 0 && lastVol >= avgVol * 1.1) {
         score += 1.0;
         reasons.push("Volumi presenti");
     }
 
-    // Take Profit dinamico calibrato sullo spazio reale fino al massimo di giornata e sul regime BTC
     let targetNet = BASE_TP_NET_PCT;
-    if (btcRegime.regime === "CAMBIO_FASE_DOPO_SCARICO") {
-        targetNet += 0.45;
+    if (btcRegime.allowAltBuys) {
+        if (btcRegime.regime === "CAMBIO_FASE_DOPO_SCARICO") {
+            targetNet += 0.45;
+        }
+        if (upsideRoomToDayHighPct >= 2.2) {
+            targetNet += Math.min(0.95, (upsideRoomToDayHighPct - 1.5) * 0.35);
+        }
+        if (greenCandlesLast4 >= 3 && avgVol > 0 && lastVol >= avgVol * 1.15) {
+            targetNet += 0.40;
+        }
+        if (isDailyWinner) {
+            targetNet += 0.25;
+        }
+    } else {
+        targetNet = Math.min(targetNet, 1.35);
     }
-    if (upsideRoomToDayHighPct >= 2.5) {
-        targetNet += 0.55;
-    } else if (upsideRoomToDayHighPct < 1.3) {
-        targetNet = MIN_TP_NET_PCT;
+
+    if (upsideRoomToDayHighPct > 0 && upsideRoomToDayHighPct < 1.3) {
+        targetNet = Math.min(targetNet, MIN_TP_NET_PCT);
     }
+
     targetNet = Math.max(MIN_TP_NET_PCT, Math.min(MAX_DYNAMIC_TP_NET_PCT, targetNet));
     const dynamicTpGrossPct = Number((targetNet + ESTIMATED_ROUNDTRIP_FEE_PCT).toFixed(2));
+
+    const twoRedCandles = currentPrice < prevClose && prevClose < prevPrevClose;
+    const nearDayHigh = upsideRoomToDayHighPct <= 0.85 && currentPrice < prevClose;
+    const lowVolumePullback = avgVol > 0 && lastVol < avgVol * 0.75 && currentPrice < prevClose;
+    const momentumFading = twoRedCandles || nearDayHigh || lowVolumePullback;
 
     const valid = score >= MIN_DAY_REBOUND_SCORE && holdingAboveLocalLow && upsideRoomToDayHighPct >= 1.1;
     return {
         valid,
         score,
         dynamicTpGrossPct,
+        momentumFading,
         reason: reasons.join(" + ") || "Setup non maturo"
     };
 }
@@ -365,7 +639,7 @@ async function runBotLoop() {
                     return !stablecoinsToIgnore.includes(clean);
                 });
 
-                // 1. GESTIONE POSIZIONI APERTE (adattata alla giornata e alla tenuta del movimento)
+                // 1. GESTIONE POSIZIONI APERTE (tempo illimitato fino a TP, trailing, rallentamento o stop loss / fast cut)
                 const trackedSymbolsSet = new Set();
 
                 for (const rawCurrency of assetKeys) {
@@ -421,6 +695,7 @@ async function runBotLoop() {
                         const minutesOpen = (Date.now() - entryTime) / (1000 * 60);
 
                         let dynamicTpGrossPct = Number((BASE_TP_NET_PCT + ESTIMATED_ROUNDTRIP_FEE_PCT).toFixed(2));
+                        let momentumFading = false;
                         try {
                             const [pos5m, pos1h] = await Promise.all([
                                 exchange.fetchOHLCV(symbol, TIMEFRAME_ENTRY, undefined, 24),
@@ -428,31 +703,45 @@ async function runBotLoop() {
                             ]);
                             const setup = evaluateAltDailySetup(pos5m, pos1h, dailyWinnersSet.has(symbol), btcRegime);
                             dynamicTpGrossPct = setup.dynamicTpGrossPct;
+                            momentumFading = setup.momentumFading;
                         } catch (e) {}
 
                         let isTrailingHit = false;
                         if (peakProfitPct >= TRAILING_ARM_GROSS_PCT) {
-                            const trailingStopLevel = Math.max(TRAILING_FLOOR_GROSS_PCT, peakProfitPct - TRAILING_PULLBACK_PCT);
+                            const activePullback = peakProfitPct >= EXTENDED_GAIN_TRAILING_ARM_PCT
+                                ? EXTENDED_GAIN_PULLBACK_PCT
+                                : TRAILING_PULLBACK_PCT;
+                            const dynamicFloor = peakProfitPct >= EXTENDED_GAIN_TRAILING_ARM_PCT
+                                ? Math.max(TRAILING_FLOOR_GROSS_PCT, peakProfitPct - 0.85)
+                                : TRAILING_FLOOR_GROSS_PCT;
+                            const trailingStopLevel = Math.max(dynamicFloor, peakProfitPct - activePullback);
+
                             if (profitPercentage <= trailingStopLevel) {
                                 isTrailingHit = true;
                             }
                         }
 
+                        const isFadeProfitHit = momentumFading && profitPercentage >= (ESTIMATED_ROUNDTRIP_FEE_PCT + 0.85) && peakProfitPct > profitPercentage + 0.25;
                         const isTpHit = profitPercentage >= dynamicTpGrossPct;
                         const isStopLossHit = profitPercentage <= STOP_LOSS_FAST_CUT_PCT || btcRegime.regime === "CRASH_LIVE";
-                        const isMaxTimeHit = minutesOpen >= MAX_HOLD_MINUTES && profitPercentage > ESTIMATED_ROUNDTRIP_FEE_PCT;
 
-                        console.log(`[Posizione] ${symbol} (€${(freeCoinAmount * currentPrice).toFixed(2)}) | PnL: ${profitPercentage.toFixed(2)}% | Picco: +${peakProfitPct.toFixed(2)}% | TP: +${dynamicTpGrossPct}% | Aperta: ${minutesOpen.toFixed(0)}m`);
+                        console.log(`[Posizione] ${symbol} (€${(freeCoinAmount * currentPrice).toFixed(2)}) | PnL: ${profitPercentage.toFixed(2)}% | Picco: +${peakProfitPct.toFixed(2)}% | TP: +${dynamicTpGrossPct}% | Aperta: ${minutesOpen.toFixed(0)}m (ILLIMITATA)`);
 
-                        if (isTpHit || isTrailingHit || isStopLossHit || isMaxTimeHit) {
+                        if (isTpHit || isTrailingHit || isFadeProfitHit || isStopLossHit) {
                             let reasonType = "TP DINAMICO";
                             if (btcRegime.regime === "CRASH_LIVE") reasonType = "CROLLO BTC";
-                            else if (isStopLossHit) reasonType = `STOP LOSS (${STOP_LOSS_FAST_CUT_PCT}%)`;
+                            else if (isStopLossHit) reasonType = `STOP LOSS / FAST CUT (${STOP_LOSS_FAST_CUT_PCT}%)`;
                             else if (isTrailingHit) reasonType = `TRAILING STOP (picco +${peakProfitPct.toFixed(2)}%)`;
+                            else if (isFadeProfitHit) reasonType = `INCASSO SU RALLENTAMENTO (picco +${peakProfitPct.toFixed(2)}%)`;
                             else if (isTpHit) reasonType = `TP DINAMICO (+${dynamicTpGrossPct}%)`;
-                            else if (isMaxTimeHit) reasonType = `INCASSO TEMPO (${minutesOpen.toFixed(0)}m)`;
 
-                            console.log(`[VENDITA] Chiusura (${reasonType}) su ${symbol} (PnL: ${profitPercentage.toFixed(2)}%)...`);
+                            const sellBook = await evaluateOrderBookForExecution(symbol, 'sell');
+                            if (!sellBook.ok && !isStopLossHit && btcRegime.regime !== "CRASH_LIVE") {
+                                console.log(`[BOOK VENDITA IN ATTESA] ${symbol}: ${sellBook.reason}. Rimando chiusura (${reasonType}) al prossimo ciclo.`);
+                                continue;
+                            }
+
+                            console.log(`[VENDITA] Chiusura (${reasonType}) su ${symbol} (PnL: ${profitPercentage.toFixed(2)}%) | ${sellBook.reason || 'Emergenza'}...`);
                             const sellRes = await exchange.createMarketSellOrder(symbol, freeCoinAmount);
                             console.log(`[VENDITA OK] ${symbol} chiusa! ID:`, sellRes.id);
                             lastLog = `Chiuso ${symbol} (${reasonType}) - PnL: ${profitPercentage.toFixed(2)}%`;
@@ -538,7 +827,7 @@ async function runBotLoop() {
                     continue;
                 }
 
-                // 3. SCANNER GIORNALIERO / CAMBIO DI FASE SULLE ALTCOIN
+                // 3. SCANNER GIORNALIERO / CAMBIO DI FASE SULLE ALTCOIN + LETTURA BOOK & ORDINE LIMITE
                 for (const symbol of focusedHotPool) {
                     try {
                         if (!exchange.markets[symbol]) continue;
@@ -563,24 +852,40 @@ async function runBotLoop() {
                         const setup = evaluateAltDailySetup(ohlcv5m, ohlcv1h, dailyWinnersSet.has(symbol), btcRegime);
                         if (!setup.valid) continue;
 
+                        const bookEval = await evaluateOrderBookForExecution(symbol, 'buy');
+                        if (!bookEval.ok) {
+                            console.log(`[Book Filtro Buy] ${symbol} saltato: ${bookEval.reason}`);
+                            continue;
+                        }
+
                         let targetInvestmentSize = ORDER_SIZE_EUR;
                         if (eurBalance < targetInvestmentSize) targetInvestmentSize = eurBalance;
 
                         if (eurBalance >= ORDER_SIZE_EUR || eurBalance >= 5) {
-                            const amountToBuy = targetInvestmentSize / currentPrice;
-                            console.log(`[Buy Setup] Ordine da €${targetInvestmentSize} su ${symbol} (Score ${setup.score.toFixed(1)}, TP +${setup.dynamicTpGrossPct}%) a €${currentPrice}...`);
+                            const refPrice = bookEval.bestBid > 0 ? bookEval.bestBid : currentPrice;
+                            const amountToBuy = targetInvestmentSize / refPrice;
+
+                            console.log(`[Buy Setup Book] Tentativo limite da €${targetInvestmentSize} su ${symbol} (Score ${setup.score.toFixed(1)}, TP +${setup.dynamicTpGrossPct}%) | ${bookEval.reason}...`);
 
                             try {
-                                await exchange.createMarketBuyOrder(symbol, amountToBuy);
+                                const limitResult = await placeTimedLimitBuyOnBook(symbol, amountToBuy, bookEval);
+                                if (!limitResult.filled) {
+                                    console.log(`[Limit Non Eseguito] ${symbol}: ${limitResult.reason}`);
+                                    continue;
+                                }
+
+                                const actualEntry = limitResult.execPrice || refPrice;
+                                const actualAmount = limitResult.amount || amountToBuy;
+
                                 activePositions[symbol] = {
-                                    entryPrice: currentPrice,
-                                    amount: amountToBuy,
+                                    entryPrice: actualEntry,
+                                    amount: actualAmount,
                                     time: Date.now(),
                                     peakProfitPct: 0
                                 };
                                 lastBuyTimestamp = Date.now();
-                                console.log(`[BUY OK] Acquistati €${targetInvestmentSize} di ${symbol} | ${setup.reason}`);
-                                lastLog = `Acquistati €${targetInvestmentSize} di ${symbol} (TP +${setup.dynamicTpGrossPct}%)`;
+                                console.log(`[BUY LIMIT OK] Acquistati ~€${(actualAmount * actualEntry).toFixed(2)} di ${symbol} @ €${actualEntry} | ${setup.reason}`);
+                                lastLog = `Acquistati ~€${(actualAmount * actualEntry).toFixed(2)} di ${symbol} (TP +${setup.dynamicTpGrossPct}%)`;
                                 await new Promise(resolve => setTimeout(resolve, 5000));
                                 break;
                             } catch (orderErr) {
