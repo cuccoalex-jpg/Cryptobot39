@@ -17,7 +17,7 @@ const exchange = new ccxt.kraken({
 });
 
 let botRunning = true;
-let lastLog = "Bot avviato: Fibo Multi-TF (24h/4h/1h/15m/5m) + Supporti (5/15/30m) + EMA/RSI/BB + TP Lordo 1.7% (10€).";
+let lastLog = "Bot avviato: Fibo Multi-TF + Supporti (5/15/30m) + EMA/RSI/BB + Volumi Interpretati + TP 1.7% (10€).";
 let focusedHotPool = [];
 let dailyWinnersSet = new Set();
 let dailyLosersSet = new Set();
@@ -38,6 +38,9 @@ const customWatchlistSymbols = [
     'LINK/EUR', 'GM/EUR', 'CRO/EUR', 'MNT/EUR', 'GRT/EUR',
     'UNI/EUR', 'ENA/EUR'
 ];
+
+// Soglie Vincenti / Perdenti 24h (CMC + ticker Kraken)
+const MOVER_THRESHOLD_PCT = 2.0;
 
 // Parametri Operativi (tempo illimitato fino a TP lordo 1.7% o Stop Loss / Fast Cut)
 const ORDER_SIZE_EUR = 10;
@@ -125,7 +128,7 @@ function getItalyDayAndMinutes() {
     };
 }
 
-// ================= INDICATORI TECNICI (EMA, RSI, BOLLINGER, FIBONACCI) =================
+// ================= INDICATORI TECNICI (EMA, RSI, BOLLINGER, FIBONACCI, VOLUMI) =================
 
 function calculateEMA(values, period) {
     if (!values || values.length < period) return null;
@@ -172,6 +175,75 @@ function calculateBollingerBands(closes, period = 20, stdMult = 2) {
         middle: mean,
         upper: mean + stdMult * stdDev,
         lower: mean - stdMult * stdDev
+    };
+}
+
+// Interpreta i volumi in base alla direzione della candela e alla forma (corpo vs ombra)
+function interpretVolumeContext(lastCandle, prevCandle, avgVol) {
+    if (!lastCandle || !avgVol || avgVol <= 0) {
+        return { label: "VOL_ND", scoreDelta: 0, allowLowVolMove: true };
+    }
+
+    const open = lastCandle[1];
+    const high = lastCandle[2];
+    const low = lastCandle[3];
+    const close = lastCandle[4];
+    const vol = lastCandle[5] || 0;
+    const ratio = vol / avgVol;
+
+    const isGreen = close >= open;
+    const candleRange = Math.max(high - low, 1e-12);
+    const bodySize = Math.abs(close - open);
+    const upperWickRatio = (high - Math.max(open, close)) / candleRange;
+
+    // 1. Scarico pesante su candela rossa con volumi superiori alla media
+    if (!isGreen && ratio >= 1.15 && close < (prevCandle ? prevCandle[4] : open)) {
+        return {
+            label: `SCARICO_VOL(${ratio.toFixed(1)}x)`,
+            scoreDelta: -1.5,
+            allowLowVolMove: false
+        };
+    }
+
+    // 2. Picco anomalo (>2.2x) ma candela debole o con lunga ombra superiore (possibile assorbimento/respinta)
+    if (ratio >= 2.2 && (upperWickRatio >= 0.45 || bodySize / candleRange < 0.30)) {
+        return {
+            label: `SPIKE_OMBRA(${ratio.toFixed(1)}x)`,
+            scoreDelta: -0.75,
+            allowLowVolMove: true
+        };
+    }
+
+    // 3. Spinta sana su candela verde con volumi sopra la media
+    if (isGreen && ratio >= 1.15) {
+        return {
+            label: `SPINTA_VOL(${ratio.toFixed(1)}x)`,
+            scoreDelta: 1.0,
+            allowLowVolMove: true
+        };
+    }
+
+    // 4. Volume basso (<0.75x): penalizzato solo se la candela è rossa; se è verde/ordinata può andare lo stesso
+    if (ratio < 0.75) {
+        if (isGreen) {
+            return {
+                label: `BASSO_ORDINATO(${ratio.toFixed(1)}x)`,
+                scoreDelta: 0.25,
+                allowLowVolMove: true
+            };
+        }
+        return {
+            label: `BASSO_FIACCO(${ratio.toFixed(1)}x)`,
+            scoreDelta: -0.4,
+            allowLowVolMove: false
+        };
+    }
+
+    // 5. Volume nella norma (0.75x - 1.15x)
+    return {
+        label: `NORMALE(${ratio.toFixed(1)}x)`,
+        scoreDelta: isGreen ? 0.5 : 0,
+        allowLowVolMove: true
     };
 }
 
@@ -249,7 +321,6 @@ async function evaluateBtcMultiTimeframeFibo() {
             return { allowAltBuys: false, regime: "NO_DATA", fibScore: 0, summary: "Dati multi-timeframe BTC insufficienti" };
         }
 
-        // 24h = 24 candele da 1h | 4h = ultime 4 candele da 1h (o 16 da 15m) | 1h = ultime 4 candele da 15m | 15m = ultime 3 candele da 5m | 5m = ultime 2 candele da 5m
         const fib24h = evaluateSingleTimeframeFibo(ohlcv1h, 24, livePrice, "24h");
         const fib4h = evaluateSingleTimeframeFibo(ohlcv15m, 16, livePrice, "4h");
         const fib1h = evaluateSingleTimeframeFibo(ohlcv15m, 4, livePrice, "1h");
@@ -489,7 +560,7 @@ async function evaluateMacroAndGeopolitics() {
     return { blocked: false, reason: "OK" };
 }
 
-// ================= ANALISI SUPPORTI (5m, 15m, 30m) + EMA + RSI + BOLLINGER + GAINERS/LOSERS =================
+// ================= ANALISI SUPPORTI (5m, 15m, 30m) + EMA + RSI + BOLLINGER + VOLUMI + GAINERS/LOSERS =================
 
 function evaluateMultiSupportAndIndicatorsSetup(ohlcv5m, ohlcv15m, ohlcv30m, isWinner, isLoser) {
     if (!ohlcv5m || ohlcv5m.length < 25 || !ohlcv15m || ohlcv15m.length < 25 || !ohlcv30m || ohlcv30m.length < 20) {
@@ -498,12 +569,10 @@ function evaluateMultiSupportAndIndicatorsSetup(ohlcv5m, ohlcv15m, ohlcv30m, isW
 
     const closes5m = ohlcv5m.map(c => c[4]);
     const lows5m = ohlcv5m.map(c => c[3]);
-    const highs5m = ohlcv5m.map(c => c[2]);
     const vols5m = ohlcv5m.map(c => c[5]);
 
     const closes15m = ohlcv15m.map(c => c[4]);
     const lows15m = ohlcv15m.map(c => c[3]);
-    const highs15m = ohlcv15m.map(c => c[2]);
 
     const closes30m = ohlcv30m.map(c => c[4]);
     const lows30m = ohlcv30m.map(c => c[3]);
@@ -512,7 +581,6 @@ function evaluateMultiSupportAndIndicatorsSetup(ohlcv5m, ohlcv15m, ohlcv30m, isW
     const currentPrice = closes5m[closes5m.length - 1];
     const prevClose5m = closes5m[closes5m.length - 2];
 
-    // 1. Supporti dinamici su 5m, 15m e 30m (ultime 16 candele esclusa l'ultima)
     const support5m = Math.min(...lows5m.slice(-16, -1));
     const support15m = Math.min(...lows15m.slice(-16, -1));
     const support30m = Math.min(...lows30m.slice(-16, -1));
@@ -521,38 +589,34 @@ function evaluateMultiSupportAndIndicatorsSetup(ohlcv5m, ohlcv15m, ohlcv30m, isW
     const distSup15mPct = support15m > 0 ? ((currentPrice - support15m) / support15m) * 100 : 99;
     const distSup30mPct = support30m > 0 ? ((currentPrice - support30m) / support30m) * 100 : 99;
 
-    // Il prezzo deve reggere sopra i supporti (non in rottura al ribasso) ed essere vicino ad almeno uno di essi
     const notBreakingSupports = currentPrice >= support5m * 0.998 && currentPrice >= support15m * 0.997;
     const nearSupport5m = distSup5mPct >= 0 && distSup5mPct <= 0.75;
     const nearSupport15m = distSup15mPct >= 0 && distSup15mPct <= 1.15;
     const nearSupport30m = distSup30mPct >= 0 && distSup30mPct <= 1.50;
 
-    // 2. Medie Mobili Esponenziali (EMA 9 e EMA 21 su 5m e 15m)
     const ema9_5m = calculateEMA(closes5m, 9);
     const ema21_5m = calculateEMA(closes5m, 21);
     const ema9_15m = calculateEMA(closes15m, 9);
     const ema21_15m = calculateEMA(closes15m, 21);
 
-    // 3. RSI (14) su 5m e 15m
     const rsi5m = calculateRSI(closes5m, 14);
     const rsi15m = calculateRSI(closes15m, 14);
 
-    // 4. Bande di Bollinger (20, 2) su 5m e 15m
     const bb5m = calculateBollingerBands(closes5m, 20, 2);
     const bb15m = calculateBollingerBands(closes15m, 20, 2);
 
-    // 5. Spazio verso la resistenza locale (massimi recenti 15m/30m) per assicurarsi spazio per il +1.7% lordo
     const localRes30m = Math.max(...highs30m.slice(-12));
     const roomToResPct = currentPrice > 0 ? ((localRes30m - currentPrice) / currentPrice) * 100 : 0;
 
-    // 6. Volumi 5m
+    // Interpretazione contestuale dei volumi 5m (non penalizza chi sale con poco volume in modo ordinato)
     const avgVol5m = vols5m.slice(-8, -1).reduce((a, b) => a + b, 0) / 7;
-    const lastVol5m = vols5m[vols5m.length - 1];
+    const lastCandle5m = ohlcv5m[ohlcv5m.length - 1];
+    const prevCandle5m = ohlcv5m[ohlcv5m.length - 2];
+    const volCtx = interpretVolumeContext(lastCandle5m, prevCandle5m, avgVol5m);
 
     let score = 0;
     const reasons = [];
 
-    // Punteggio Supporti 5m / 15m / 30m
     if (nearSupport5m) {
         score += 1.5;
         reasons.push(`Sup 5m (€${support5m})`);
@@ -566,7 +630,6 @@ function evaluateMultiSupportAndIndicatorsSetup(ohlcv5m, ohlcv15m, ohlcv30m, isW
         reasons.push(`Sup 30m (€${support30m})`);
     }
 
-    // Punteggio RSI (ipervenduto / ripartenza tra 30 e 58)
     if (rsi5m >= 28 && rsi5m <= 54 && currentPrice >= prevClose5m) {
         score += 1.75;
         reasons.push(`RSI 5m ${rsi5m.toFixed(0)}`);
@@ -580,7 +643,6 @@ function evaluateMultiSupportAndIndicatorsSetup(ohlcv5m, ohlcv15m, ohlcv30m, isW
         reasons.push(`RSI 15m ${rsi15m.toFixed(0)}`);
     }
 
-    // Punteggio Medie Mobili EMA 9 / EMA 21
     if (ema9_5m && ema21_5m && currentPrice >= ema9_5m && ema9_5m >= ema21_5m * 0.998) {
         score += 1.5;
         reasons.push("EMA9>EMA21 5m");
@@ -594,7 +656,6 @@ function evaluateMultiSupportAndIndicatorsSetup(ohlcv5m, ohlcv15m, ohlcv30m, isW
         reasons.push("EMA 15m OK");
     }
 
-    // Punteggio Bande di Bollinger (rimbalzo dalla banda inferiore o mediana)
     if (bb5m && currentPrice <= bb5m.middle && currentPrice >= bb5m.lower * 0.997 && currentPrice >= prevClose5m) {
         score += 1.25;
         reasons.push("Rimbalzo BB 5m");
@@ -604,13 +665,10 @@ function evaluateMultiSupportAndIndicatorsSetup(ohlcv5m, ohlcv15m, ohlcv30m, isW
         reasons.push("Zona bassa BB 15m");
     }
 
-    // Punteggio Volumi
-    if (avgVol5m > 0 && lastVol5m >= avgVol5m * 1.1) {
-        score += 0.75;
-        reasons.push("Volumi +");
-    }
+    // Applica interpretazione volumi
+    score += volCtx.scoreDelta;
+    reasons.push(volCtx.label);
 
-    // Bonus/Contesto da lista Vincenti e Perdenti (Gainers / Losers in rimbalzo)
     if (isWinner) {
         score += 1.0;
         reasons.push("Top Gainer");
@@ -619,14 +677,13 @@ function evaluateMultiSupportAndIndicatorsSetup(ohlcv5m, ohlcv15m, ohlcv30m, isW
         reasons.push("Top Loser su supporto");
     }
 
-    // Verifica spazio minimo verso resistenza recente per poter chiudere il +1.7% lordo
     if (roomToResPct < 1.15) {
         score -= 1.5;
         reasons.push(`Resistenza vicina (+${roomToResPct.toFixed(1)}%)`);
     }
 
     const hasSupportConfluence = nearSupport5m || nearSupport15m || nearSupport30m;
-    const valid = notBreakingSupports && hasSupportConfluence && score >= MIN_TECHNICAL_ENTRY_SCORE && currentPrice >= prevClose5m;
+    const valid = notBreakingSupports && hasSupportConfluence && volCtx.allowLowVolMove && score >= MIN_TECHNICAL_ENTRY_SCORE && currentPrice >= prevClose5m;
 
     return {
         valid,
@@ -722,7 +779,6 @@ async function runBotLoop() {
 
                         const minutesOpen = (Date.now() - entryTime) / (1000 * 60);
 
-                        // Trailing protettivo stretto se sale oltre +1.15% lordo ma ritraccia prima del +1.70%
                         let isTrailingHit = false;
                         if (peakProfitPct >= TRAILING_ARM_GROSS_PCT) {
                             const trailingStopLevel = Math.max(TRAILING_FLOOR_GROSS_PCT, peakProfitPct - TRAILING_PULLBACK_PCT);
@@ -771,13 +827,50 @@ async function runBotLoop() {
                     }
                 }
 
-                // 2. AGGIORNAMENTO WATCHLIST + VINCENTI & PERDENTI (GAINERS & LOSERS)
+                // 2. AGGIORNAMENTO WATCHLIST + VINCENTI & PERDENTI (CMC + TICKER KRAKEN)
                 const currentTime = Date.now();
                 if (focusedHotPool.length === 0 || (currentTime - lastHotPoolUpdate > 10 * 60 * 1000)) {
                     let candidateSymbols = [...customWatchlistSymbols];
                     let volumeMap = {};
                     const nextWinnersSet = new Set();
                     const nextLosersSet = new Set();
+
+                    try {
+                        const eurMarketSymbols = Object.keys(exchange.markets).filter(sym => {
+                            if (!sym.endsWith('/EUR')) return false;
+                            const m = exchange.markets[sym];
+                            if (!m || !m.active) return false;
+                            const base = sym.split('/')[0];
+                            return !stablecoinsToIgnore.includes(base) && base !== 'ETH' && base !== 'XETH';
+                        });
+
+                        const tickers = await exchange.fetchTickers(eurMarketSymbols);
+                        for (const sym of eurMarketSymbols) {
+                            const t = tickers[sym];
+                            if (!t) continue;
+                            const quoteVol = typeof t.quoteVolume === 'number' && t.quoteVolume > 0
+                                ? t.quoteVolume
+                                : (typeof t.baseVolume === 'number' && typeof t.last === 'number' ? t.baseVolume * t.last : 0);
+                            if (quoteVol > 0) volumeMap[sym] = quoteVol;
+
+                            let pct = typeof t.percentage === 'number' ? t.percentage : null;
+                            if (pct === null && typeof t.open === 'number' && t.open > 0 && typeof t.last === 'number') {
+                                pct = ((t.last - t.open) / t.open) * 100;
+                            }
+
+                            if (typeof pct === 'number') {
+                                if (pct >= MOVER_THRESHOLD_PCT) {
+                                    nextWinnersSet.add(sym);
+                                    if (!candidateSymbols.includes(sym)) candidateSymbols.push(sym);
+                                } else if (pct <= -MOVER_THRESHOLD_PCT) {
+                                    nextLosersSet.add(sym);
+                                    if (!candidateSymbols.includes(sym)) candidateSymbols.push(sym);
+                                }
+                            }
+                        }
+                    } catch (krakenMoversErr) {
+                        console.log(`[Movers Kraken] Errore lettura ticker 24h: ${krakenMoversErr.message}`);
+                    }
 
                     if (CMC_API_KEY) {
                         try {
@@ -788,22 +881,27 @@ async function runBotLoop() {
 
                             for (const coin of cmcResponse.data.data) {
                                 const baseSym = coin.symbol;
-                                if (stablecoinsToIgnore.includes(baseSym)) continue;
+                                if (stablecoinsToIgnore.includes(baseSym) || baseSym === 'ETH') continue;
                                 const sym = `${baseSym}/EUR`;
-                                volumeMap[baseSym] = coin.quote && coin.quote.EUR ? coin.quote.EUR.volume_24h : 0;
+                                const cmcVol = coin.quote && coin.quote.EUR ? coin.quote.EUR.volume_24h : 0;
+                                if (cmcVol > (volumeMap[sym] || 0)) volumeMap[sym] = cmcVol;
 
                                 const pct24h = coin.quote && coin.quote.EUR ? coin.quote.EUR.percent_change_24h : 0;
                                 if (exchange.markets[sym] && exchange.markets[sym].active) {
-                                    if (pct24h >= 2.0) {
+                                    if (pct24h >= MOVER_THRESHOLD_PCT) {
                                         nextWinnersSet.add(sym);
                                         if (!candidateSymbols.includes(sym)) candidateSymbols.push(sym);
-                                    } else if (pct24h <= -2.0) {
+                                    } else if (pct24h <= -MOVER_THRESHOLD_PCT) {
                                         nextLosersSet.add(sym);
                                         if (!candidateSymbols.includes(sym)) candidateSymbols.push(sym);
                                     }
                                 }
                             }
-                        } catch (e) {}
+                        } catch (cmcErr) {
+                            console.log(`[Movers CMC] Errore lettura CMC: ${cmcErr.message}`);
+                        }
+                    } else {
+                        console.log(`[Movers CMC] CMC_API_KEY non impostata: uso controllo ticker 24h Kraken + watchlist.`);
                     }
 
                     let validatedWatchlist = [];
@@ -813,17 +911,13 @@ async function runBotLoop() {
                         }
                     }
 
-                    validatedWatchlist.sort((a, b) => {
-                        const baseA = a.split('/')[0];
-                        const baseB = b.split('/')[0];
-                        return (volumeMap[baseB] || 0) - (volumeMap[baseA] || 0);
-                    });
+                    validatedWatchlist.sort((a, b) => (volumeMap[b] || 0) - (volumeMap[a] || 0));
 
                     dailyWinnersSet = nextWinnersSet;
                     dailyLosersSet = nextLosersSet;
                     focusedHotPool = validatedWatchlist;
                     lastHotPoolUpdate = currentTime;
-                    console.log(`[Focus] Watchlist (${focusedHotPool.length} coppie | Vincenti: ${dailyWinnersSet.size}, Perdenti: ${dailyLosersSet.size}): ${focusedHotPool.join(', ')}`);
+                    console.log(`[Focus] Watchlist (${focusedHotPool.length} coppie | Vincenti: ${dailyWinnersSet.size}, Perdenti: ${dailyLosersSet.size}): ${focusedHotPool.slice(0, 25).join(', ')}${focusedHotPool.length > 25 ? ' ...' : ''}`);
                 }
 
                 if (!btcRegime.allowAltBuys) {
@@ -839,7 +933,7 @@ async function runBotLoop() {
                     continue;
                 }
 
-                // 3. SCANNER SUPPORTI (5m, 15m, 30m) + EMA/RSI/BB + VINCENTI & PERDENTI
+                // 3. SCANNER SUPPORTI (5m, 15m, 30m) + EMA/RSI/BB + VOLUMI + VINCENTI & PERDENTI
                 for (const symbol of focusedHotPool) {
                     try {
                         if (!exchange.markets[symbol]) continue;
