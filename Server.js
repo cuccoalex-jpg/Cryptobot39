@@ -17,7 +17,7 @@ const exchange = new ccxt.kraken({
 });
 
 let botRunning = true;
-let lastLog = "Bot avviato: Fibo Multi-TF + Supporti (5/15/30m) + EMA/RSI/BB + Volumi Interpretati + TP 1.7% (10€).";
+let lastLog = "Bot avviato: Fibo Multi-TF + Supporti (5/15/30m) + EMA/RSI/BB + Vincenti/Perdenti CMC & Kraken + TP 1.7% (10€).";
 let focusedHotPool = [];
 let dailyWinnersSet = new Set();
 let dailyLosersSet = new Set();
@@ -128,7 +128,7 @@ function getItalyDayAndMinutes() {
     };
 }
 
-// ================= INDICATORI TECNICI (EMA, RSI, BOLLINGER, FIBONACCI, VOLUMI) =================
+// ================= INDICATORI TECNICI (EMA, RSI, BOLLINGER, FIBONACCI) =================
 
 function calculateEMA(values, period) {
     if (!values || values.length < period) return null;
@@ -175,75 +175,6 @@ function calculateBollingerBands(closes, period = 20, stdMult = 2) {
         middle: mean,
         upper: mean + stdMult * stdDev,
         lower: mean - stdMult * stdDev
-    };
-}
-
-// Interpreta i volumi in base alla direzione della candela e alla forma (corpo vs ombra)
-function interpretVolumeContext(lastCandle, prevCandle, avgVol) {
-    if (!lastCandle || !avgVol || avgVol <= 0) {
-        return { label: "VOL_ND", scoreDelta: 0, allowLowVolMove: true };
-    }
-
-    const open = lastCandle[1];
-    const high = lastCandle[2];
-    const low = lastCandle[3];
-    const close = lastCandle[4];
-    const vol = lastCandle[5] || 0;
-    const ratio = vol / avgVol;
-
-    const isGreen = close >= open;
-    const candleRange = Math.max(high - low, 1e-12);
-    const bodySize = Math.abs(close - open);
-    const upperWickRatio = (high - Math.max(open, close)) / candleRange;
-
-    // 1. Scarico pesante su candela rossa con volumi superiori alla media
-    if (!isGreen && ratio >= 1.15 && close < (prevCandle ? prevCandle[4] : open)) {
-        return {
-            label: `SCARICO_VOL(${ratio.toFixed(1)}x)`,
-            scoreDelta: -1.5,
-            allowLowVolMove: false
-        };
-    }
-
-    // 2. Picco anomalo (>2.2x) ma candela debole o con lunga ombra superiore (possibile assorbimento/respinta)
-    if (ratio >= 2.2 && (upperWickRatio >= 0.45 || bodySize / candleRange < 0.30)) {
-        return {
-            label: `SPIKE_OMBRA(${ratio.toFixed(1)}x)`,
-            scoreDelta: -0.75,
-            allowLowVolMove: true
-        };
-    }
-
-    // 3. Spinta sana su candela verde con volumi sopra la media
-    if (isGreen && ratio >= 1.15) {
-        return {
-            label: `SPINTA_VOL(${ratio.toFixed(1)}x)`,
-            scoreDelta: 1.0,
-            allowLowVolMove: true
-        };
-    }
-
-    // 4. Volume basso (<0.75x): penalizzato solo se la candela è rossa; se è verde/ordinata può andare lo stesso
-    if (ratio < 0.75) {
-        if (isGreen) {
-            return {
-                label: `BASSO_ORDINATO(${ratio.toFixed(1)}x)`,
-                scoreDelta: 0.25,
-                allowLowVolMove: true
-            };
-        }
-        return {
-            label: `BASSO_FIACCO(${ratio.toFixed(1)}x)`,
-            scoreDelta: -0.4,
-            allowLowVolMove: false
-        };
-    }
-
-    // 5. Volume nella norma (0.75x - 1.15x)
-    return {
-        label: `NORMALE(${ratio.toFixed(1)}x)`,
-        scoreDelta: isGreen ? 0.5 : 0,
-        allowLowVolMove: true
     };
 }
 
@@ -560,7 +491,7 @@ async function evaluateMacroAndGeopolitics() {
     return { blocked: false, reason: "OK" };
 }
 
-// ================= ANALISI SUPPORTI (5m, 15m, 30m) + EMA + RSI + BOLLINGER + VOLUMI + GAINERS/LOSERS =================
+// ================= ANALISI SUPPORTI (5m, 15m, 30m) + EMA + RSI + BOLLINGER + GAINERS/LOSERS =================
 
 function evaluateMultiSupportAndIndicatorsSetup(ohlcv5m, ohlcv15m, ohlcv30m, isWinner, isLoser) {
     if (!ohlcv5m || ohlcv5m.length < 25 || !ohlcv15m || ohlcv15m.length < 25 || !ohlcv30m || ohlcv30m.length < 20) {
@@ -608,11 +539,8 @@ function evaluateMultiSupportAndIndicatorsSetup(ohlcv5m, ohlcv15m, ohlcv30m, isW
     const localRes30m = Math.max(...highs30m.slice(-12));
     const roomToResPct = currentPrice > 0 ? ((localRes30m - currentPrice) / currentPrice) * 100 : 0;
 
-    // Interpretazione contestuale dei volumi 5m (non penalizza chi sale con poco volume in modo ordinato)
     const avgVol5m = vols5m.slice(-8, -1).reduce((a, b) => a + b, 0) / 7;
-    const lastCandle5m = ohlcv5m[ohlcv5m.length - 1];
-    const prevCandle5m = ohlcv5m[ohlcv5m.length - 2];
-    const volCtx = interpretVolumeContext(lastCandle5m, prevCandle5m, avgVol5m);
+    const lastVol5m = vols5m[vols5m.length - 1];
 
     let score = 0;
     const reasons = [];
@@ -665,9 +593,10 @@ function evaluateMultiSupportAndIndicatorsSetup(ohlcv5m, ohlcv15m, ohlcv30m, isW
         reasons.push("Zona bassa BB 15m");
     }
 
-    // Applica interpretazione volumi
-    score += volCtx.scoreDelta;
-    reasons.push(volCtx.label);
+    if (avgVol5m > 0 && lastVol5m >= avgVol5m * 1.1) {
+        score += 0.75;
+        reasons.push("Volumi +");
+    }
 
     if (isWinner) {
         score += 1.0;
@@ -683,7 +612,7 @@ function evaluateMultiSupportAndIndicatorsSetup(ohlcv5m, ohlcv15m, ohlcv30m, isW
     }
 
     const hasSupportConfluence = nearSupport5m || nearSupport15m || nearSupport30m;
-    const valid = notBreakingSupports && hasSupportConfluence && volCtx.allowLowVolMove && score >= MIN_TECHNICAL_ENTRY_SCORE && currentPrice >= prevClose5m;
+    const valid = notBreakingSupports && hasSupportConfluence && score >= MIN_TECHNICAL_ENTRY_SCORE && currentPrice >= prevClose5m;
 
     return {
         valid,
@@ -835,6 +764,7 @@ async function runBotLoop() {
                     const nextWinnersSet = new Set();
                     const nextLosersSet = new Set();
 
+                    // 2A. Controllo diretto sui ticker /EUR attivi su Kraken
                     try {
                         const eurMarketSymbols = Object.keys(exchange.markets).filter(sym => {
                             if (!sym.endsWith('/EUR')) return false;
@@ -872,6 +802,7 @@ async function runBotLoop() {
                         console.log(`[Movers Kraken] Errore lettura ticker 24h: ${krakenMoversErr.message}`);
                     }
 
+                    // 2B. Integrazione CoinMarketCap (se disponibile la chiave API)
                     if (CMC_API_KEY) {
                         try {
                             const cmcResponse = await axios.get('https://pro-api.coinmarketcap.com/v1/cryptocurrency/listings/latest', {
@@ -933,7 +864,7 @@ async function runBotLoop() {
                     continue;
                 }
 
-                // 3. SCANNER SUPPORTI (5m, 15m, 30m) + EMA/RSI/BB + VOLUMI + VINCENTI & PERDENTI
+                // 3. SCANNER SUPPORTI (5m, 15m, 30m) + EMA/RSI/BB + VINCENTI & PERDENTI
                 for (const symbol of focusedHotPool) {
                     try {
                         if (!exchange.markets[symbol]) continue;
