@@ -17,7 +17,7 @@ const exchange = new ccxt.kraken({
 });
 
 let botRunning = true;
-let lastLog = "Bot avviato: Fibo Multi-TF + Supporti (5/15/30m) + EMA/RSI/BB + Vincenti/Perdenti CMC & Kraken + TP 1.7% (10€).";
+let lastLog = "Bot avviato: TP Dinamico Intelligente (Asset Incerto vs In Spinta) + Fibo Multi-TF + Supporti 5/15/30m + Volumi.";
 let focusedHotPool = [];
 let dailyWinnersSet = new Set();
 let dailyLosersSet = new Set();
@@ -42,15 +42,20 @@ const customWatchlistSymbols = [
 // Soglie Vincenti / Perdenti 24h (CMC + ticker Kraken)
 const MOVER_THRESHOLD_PCT = 2.0;
 
-// Parametri Operativi (tempo illimitato fino a TP lordo 1.7% o Stop Loss / Fast Cut)
+// Parametri Operativi (tempo illimitato fino a TP dinamico, incasso su asset incerto, trailing o Stop Loss / Fast Cut)
 const ORDER_SIZE_EUR = 10;
 const ESTIMATED_ROUNDTRIP_FEE_PCT = 0.50;
-const FIXED_TP_GROSS_PCT = 1.70;              // TP lordo fisso a 1.7%
+
+// Take Profit Dinamico Lordo (adattato alla forza/incertezza dell'asset)
+const UNCERTAIN_ASSET_TP_GROSS_PCT = 0.95;      // Se l'asset è incerto/debole, prende profitto lordo buono già attorno a +0.95%
+const UNCERTAIN_FAST_PROFIT_GROSS_PCT = 0.78; // Se l'asset è incerto e perde spinta dopo aver fatto almeno +0.78% lordo, chiude subito
+const STANDARD_TP_GROSS_PCT = 1.70;             // Target standard quando la struttura è equilibrata
+const STRONG_TREND_TP_GROSS_PCT = 2.35;         // Target esteso quando l'asset sembra davvero andare (trend e indicatori forti)
 
 // Protezione trailing e Stop Loss / Fast Cut
-const TRAILING_ARM_GROSS_PCT = 1.15;          // Arma il trailing sopra +1.15% lordo
-const TRAILING_FLOOR_GROSS_PCT = 0.65;        // Protezione minima sopra le commissioni
-const TRAILING_PULLBACK_PCT = 0.35;           // Ritracciamento stretto dal picco prima di incassare
+const TRAILING_ARM_GROSS_PCT = 1.05;          // Arma il trailing sopra +1.05% lordo
+const TRAILING_FLOOR_GROSS_PCT = 0.62;        // Protezione minima sopra le commissioni
+const TRAILING_PULLBACK_PCT = 0.30;           // Ritracciamento dal picco prima di incassare
 const STOP_LOSS_FAST_CUT_PCT = -1.35;         // Stop loss / fast cut di invalidazione
 
 // Order Book: controllo spread, profondità e ordine limite temporizzato sull'ingresso
@@ -80,7 +85,7 @@ app.get('/', (req, res) => {
             <body style="font-family: Arial; padding: 20px; background: #111; color: #fff;">
                 <h1>Cryptobot39 - Stato: ${botRunning ? 'ATTIVO & OPERATIVO' : 'FERMO'}</h1>
                 <p><b>Ultima attività:</b> ${lastLog}</p>
-                <p><b>TP Lordo Fisso:</b> +${FIXED_TP_GROSS_PCT}% | <b>Stop/Fast Cut:</b> ${STOP_LOSS_FAST_CUT_PCT}% | <b>Tempo:</b> Illimitato</p>
+                <p><b>TP Dinamico Lordo:</b> Incerto ~+${UNCERTAIN_ASSET_TP_GROSS_PCT}% | Base +${STANDARD_TP_GROSS_PCT}% | Forte +${STRONG_TREND_TP_GROSS_PCT}% | <b>Stop/Fast Cut:</b> ${STOP_LOSS_FAST_CUT_PCT}%</p>
                 <p><b>Posizioni Attive (>= €${MIN_TRACKED_POSITION_EUR}):</b> ${Object.keys(activePositions).length > 0 ? Object.keys(activePositions).join(', ') : 'Nessuna'}</p>
                 <p><b>Watchlist Attiva:</b> ${focusedHotPool.length > 0 ? focusedHotPool.join(', ') : 'Sincronizzazione in corso...'}</p>
             </body>
@@ -128,7 +133,7 @@ function getItalyDayAndMinutes() {
     };
 }
 
-// ================= INDICATORI TECNICI (EMA, RSI, BOLLINGER, FIBONACCI) =================
+// ================= INDICATORI TECNICI (EMA, RSI, BOLLINGER, FIBONACCI, VOLUMI) =================
 
 function calculateEMA(values, period) {
     if (!values || values.length < period) return null;
@@ -175,6 +180,194 @@ function calculateBollingerBands(closes, period = 20, stdMult = 2) {
         middle: mean,
         upper: mean + stdMult * stdDev,
         lower: mean - stdMult * stdDev
+    };
+}
+
+function interpretVolumeContext(lastCandle, prevCandle, avgVol) {
+    if (!lastCandle || !avgVol || avgVol <= 0) {
+        return { label: "VOL_ND", scoreDelta: 0, allowLowVolMove: true };
+    }
+
+    const open = lastCandle[1];
+    const high = lastCandle[2];
+    const low = lastCandle[3];
+    const close = lastCandle[4];
+    const vol = lastCandle[5] || 0;
+    const ratio = vol / avgVol;
+
+    const isGreen = close >= open;
+    const candleRange = Math.max(high - low, 1e-12);
+    const bodySize = Math.abs(close - open);
+    const upperWickRatio = (high - Math.max(open, close)) / candleRange;
+
+    if (!isGreen && ratio >= 1.15 && close < (prevCandle ? prevCandle[4] : open)) {
+        return {
+            label: `SCARICO_VOL(${ratio.toFixed(1)}x)`,
+            scoreDelta: -1.5,
+            allowLowVolMove: false
+        };
+    }
+
+    if (ratio >= 2.2 && (upperWickRatio >= 0.45 || bodySize / candleRange < 0.30)) {
+        return {
+            label: `SPIKE_OMBRA(${ratio.toFixed(1)}x)`,
+            scoreDelta: -0.75,
+            allowLowVolMove: true
+        };
+    }
+
+    if (isGreen && ratio >= 1.15) {
+        return {
+            label: `SPINTA_VOL(${ratio.toFixed(1)}x)`,
+            scoreDelta: 1.0,
+            allowLowVolMove: true
+        };
+    }
+
+    if (ratio < 0.75) {
+        if (isGreen) {
+            return {
+                label: `BASSO_ORDINATO(${ratio.toFixed(1)}x)`,
+                scoreDelta: 0.25,
+                allowLowVolMove: true
+            };
+        }
+        return {
+            label: `BASSO_FIACCO(${ratio.toFixed(1)}x)`,
+            scoreDelta: -0.4,
+            allowLowVolMove: false
+        };
+    }
+
+    return {
+        label: `NORMALE(${ratio.toFixed(1)}x)`,
+        scoreDelta: isGreen ? 0.5 : 0,
+        allowLowVolMove: true
+    };
+}
+
+// VALUTA DINAMICAMENTE SE UNA POSIZIONE APERTA È SU UN ASSET INCERTO O IN SPINTA REALE
+function evaluateOpenPositionDynamicHealth(ohlcv5m, ohlcv15m, ohlcv30m, currentPrice, profitPercentage, peakProfitPct, btcRegime) {
+    if (!ohlcv5m || ohlcv5m.length < 15 || !ohlcv15m || ohlcv15m.length < 15) {
+        return {
+            state: "INCERTO",
+            dynamicTpGrossPct: UNCERTAIN_ASSET_TP_GROSS_PCT,
+            shouldTakeUncertainProfit: false,
+            reason: "Dati ridotti -> TP prudente"
+        };
+    }
+
+    const closes5m = ohlcv5m.map(c => c[4]);
+    const lows5m = ohlcv5m.map(c => c[3]);
+    const highs5m = ohlcv5m.map(c => c[2]);
+
+    const closes15m = ohlcv15m.map(c => c[4]);
+    const highs15m = ohlcv15m.map(c => c[2]);
+
+    const closes30m = (ohlcv30m && ohlcv30m.length >= 12) ? ohlcv30m.map(c => c[4]) : closes15m;
+
+    const ema9_5m = calculateEMA(closes5m, 9);
+    const ema21_5m = calculateEMA(closes5m, 21);
+    const ema9_15m = calculateEMA(closes15m, 9);
+    const ema21_15m = calculateEMA(closes15m, 21);
+
+    const rsi5m = calculateRSI(closes5m, 14);
+    const rsi15m = calculateRSI(closes15m, 14);
+
+    const last5m = ohlcv5m[ohlcv5m.length - 1];
+    const prev5m = ohlcv5m[ohlcv5m.length - 2];
+    const last15m = ohlcv15m[ohlcv15m.length - 1];
+
+    const last5mRed = last5m[4] < last5m[1];
+    const prev5mRed = prev5m[4] < prev5m[1];
+    const twoRed5m = last5mRed && prev5mRed;
+    const pullingBackFromPeak = peakProfitPct > profitPercentage + 0.22;
+
+    // Resistenza locale per capire se c'è spazio o muro vicino
+    const localHigh15m = Math.max(...highs15m.slice(-10, -1));
+    const roomToLocalHighPct = currentPrice > 0 ? ((localHigh15m - currentPrice) / currentPrice) * 100 : 0;
+
+    // Conteggio segnali di forza vs segnali di incertezza/debolezza
+    let strengthPoints = 0;
+    let uncertaintyPoints = 0;
+    const notes = [];
+
+    if (ema9_5m && ema21_5m && currentPrice >= ema9_5m && ema9_5m >= ema21_5m * 0.999) {
+        strengthPoints += 1.5;
+        notes.push("EMA5m allineate");
+    } else if (ema21_5m && currentPrice < ema21_5m) {
+        uncertaintyPoints += 1.5;
+        notes.push("sotto EMA21 5m");
+    }
+
+    if (ema9_15m && ema21_15m && currentPrice >= ema9_15m && ema9_15m >= ema21_15m * 0.998) {
+        strengthPoints += 1.5;
+        notes.push("trend 15m solido");
+    } else if (ema21_15m && currentPrice < ema21_15m) {
+        uncertaintyPoints += 1.5;
+        notes.push("sotto EMA21 15m");
+    }
+
+    if (rsi5m >= 52 && rsi5m <= 74 && rsi15m >= 50) {
+        strengthPoints += 1.0;
+        notes.push(`RSI in spinta (${rsi5m.toFixed(0)}/${rsi15m.toFixed(0)})`);
+    } else if (rsi15m < 44 || rsi5m < 42) {
+        uncertaintyPoints += 1.25;
+        notes.push(`RSI debole (${rsi5m.toFixed(0)}/${rsi15m.toFixed(0)})`);
+    }
+
+    if (!last5mRed && last15m[4] >= last15m[1]) {
+        strengthPoints += 0.75;
+        notes.push("candele verdi");
+    } else if (twoRed5m) {
+        uncertaintyPoints += 1.25;
+        notes.push("2 rosse 5m");
+    }
+
+    if (btcRegime && btcRegime.allowAltBuys && btcRegime.fibScore >= 1.5) {
+        strengthPoints += 0.75;
+    } else if (!btcRegime || !btcRegime.allowAltBuys) {
+        uncertaintyPoints += 1.25;
+        notes.push("BTC non spinge");
+    }
+
+    if (roomToLocalHighPct > 0 && roomToLocalHighPct < 0.85 && profitPercentage > 0.5) {
+        uncertaintyPoints += 1.0;
+        notes.push(`resistenza vicina (+${roomToLocalHighPct.toFixed(1)}%)`);
+    }
+
+    const recentLow5m = Math.min(...lows5m.slice(-8, -1));
+    if (currentPrice < recentLow5m * 0.998 && closes30m[closes30m.length - 1] < closes30m[closes30m.length - 2]) {
+        uncertaintyPoints += 1.0;
+        notes.push("rottura micro-supporto");
+    }
+
+    // Classificazione finale dell'asset: IN_SPINTA vs INCERTO vs NEUTRO
+    let state = "NEUTRO";
+    let dynamicTpGrossPct = STANDARD_TP_GROSS_PCT;
+
+    if (uncertaintyPoints >= 2.25 || (uncertaintyPoints > strengthPoints && profitPercentage > 0)) {
+        state = "INCERTO";
+        dynamicTpGrossPct = UNCERTAIN_ASSET_TP_GROSS_PCT;
+    } else if (strengthPoints >= 3.25 && uncertaintyPoints <= 0.75 && roomToLocalHighPct >= 1.2) {
+        state = "IN_SPINTA";
+        dynamicTpGrossPct = STRONG_TREND_TP_GROSS_PCT;
+    } else {
+        state = "NEUTRO";
+        dynamicTpGrossPct = STANDARD_TP_GROSS_PCT;
+    }
+
+    // Se l'asset è INCERTO, ha già un guadagno lordo buono (>= UNCERTAIN_FAST_PROFIT_GROSS_PCT) e sta perdendo spinta/ritracciando, chiudi subito senza aspettare oltre
+    const shouldTakeUncertainProfit =
+        state === "INCERTO" &&
+        profitPercentage >= UNCERTAIN_FAST_PROFIT_GROSS_PCT &&
+        (twoRed5m || pullingBackFromPeak || (ema9_5m && currentPrice < ema9_5m));
+
+    return {
+        state,
+        dynamicTpGrossPct,
+        shouldTakeUncertainProfit,
+        reason: notes.slice(0, 3).join(", ") || state
     };
 }
 
@@ -491,7 +684,7 @@ async function evaluateMacroAndGeopolitics() {
     return { blocked: false, reason: "OK" };
 }
 
-// ================= ANALISI SUPPORTI (5m, 15m, 30m) + EMA + RSI + BOLLINGER + GAINERS/LOSERS =================
+// ================= ANALISI SUPPORTI (5m, 15m, 30m) + EMA + RSI + BOLLINGER + VOLUMI + GAINERS/LOSERS =================
 
 function evaluateMultiSupportAndIndicatorsSetup(ohlcv5m, ohlcv15m, ohlcv30m, isWinner, isLoser) {
     if (!ohlcv5m || ohlcv5m.length < 25 || !ohlcv15m || ohlcv15m.length < 25 || !ohlcv30m || ohlcv30m.length < 20) {
@@ -540,7 +733,9 @@ function evaluateMultiSupportAndIndicatorsSetup(ohlcv5m, ohlcv15m, ohlcv30m, isW
     const roomToResPct = currentPrice > 0 ? ((localRes30m - currentPrice) / currentPrice) * 100 : 0;
 
     const avgVol5m = vols5m.slice(-8, -1).reduce((a, b) => a + b, 0) / 7;
-    const lastVol5m = vols5m[vols5m.length - 1];
+    const lastCandle5m = ohlcv5m[ohlcv5m.length - 1];
+    const prevCandle5m = ohlcv5m[ohlcv5m.length - 2];
+    const volCtx = interpretVolumeContext(lastCandle5m, prevCandle5m, avgVol5m);
 
     let score = 0;
     const reasons = [];
@@ -593,10 +788,8 @@ function evaluateMultiSupportAndIndicatorsSetup(ohlcv5m, ohlcv15m, ohlcv30m, isW
         reasons.push("Zona bassa BB 15m");
     }
 
-    if (avgVol5m > 0 && lastVol5m >= avgVol5m * 1.1) {
-        score += 0.75;
-        reasons.push("Volumi +");
-    }
+    score += volCtx.scoreDelta;
+    reasons.push(volCtx.label);
 
     if (isWinner) {
         score += 1.0;
@@ -612,7 +805,7 @@ function evaluateMultiSupportAndIndicatorsSetup(ohlcv5m, ohlcv15m, ohlcv30m, isW
     }
 
     const hasSupportConfluence = nearSupport5m || nearSupport15m || nearSupport30m;
-    const valid = notBreakingSupports && hasSupportConfluence && score >= MIN_TECHNICAL_ENTRY_SCORE && currentPrice >= prevClose5m;
+    const valid = notBreakingSupports && hasSupportConfluence && volCtx.allowLowVolMove && score >= MIN_TECHNICAL_ENTRY_SCORE && currentPrice >= prevClose5m;
 
     return {
         valid,
@@ -653,7 +846,7 @@ async function runBotLoop() {
                     return !stablecoinsToIgnore.includes(clean);
                 });
 
-                // 1. GESTIONE POSIZIONI APERTE (Tempo illimitato fino a TP lordo 1.7%, trailing o Stop Loss / Fast Cut)
+                // 1. GESTIONE POSIZIONI APERTE (Tempo illimitato fino a TP dinamico, incasso asset incerto, trailing o Stop Loss / Fast Cut)
                 const trackedSymbolsSet = new Set();
 
                 for (const rawCurrency of assetKeys) {
@@ -708,23 +901,44 @@ async function runBotLoop() {
 
                         const minutesOpen = (Date.now() - entryTime) / (1000 * 60);
 
+                        let assetState = "NEUTRO";
+                        let dynamicTpGrossPct = STANDARD_TP_GROSS_PCT;
+                        let shouldTakeUncertainProfit = false;
+                        let healthReason = "";
+
+                        try {
+                            const [p5m, p15m, p30m] = await Promise.all([
+                                exchange.fetchOHLCV(symbol, '5m', undefined, 25),
+                                exchange.fetchOHLCV(symbol, '15m', undefined, 25),
+                                exchange.fetchOHLCV(symbol, '30m', undefined, 16)
+                            ]);
+                            const health = evaluateOpenPositionDynamicHealth(p5m, p15m, p30m, currentPrice, profitPercentage, peakProfitPct, btcRegime);
+                            assetState = health.state;
+                            dynamicTpGrossPct = health.dynamicTpGrossPct;
+                            shouldTakeUncertainProfit = health.shouldTakeUncertainProfit;
+                            healthReason = health.reason;
+                        } catch (e) {}
+
                         let isTrailingHit = false;
-                        if (peakProfitPct >= TRAILING_ARM_GROSS_PCT) {
-                            const trailingStopLevel = Math.max(TRAILING_FLOOR_GROSS_PCT, peakProfitPct - TRAILING_PULLBACK_PCT);
+                        const armThreshold = assetState === "INCERTO" ? UNCERTAIN_ASSET_TP_GROSS_PCT : TRAILING_ARM_GROSS_PCT;
+                        const pullbackThreshold = assetState === "INCERTO" ? 0.22 : TRAILING_PULLBACK_PCT;
+                        if (peakProfitPct >= armThreshold) {
+                            const trailingStopLevel = Math.max(TRAILING_FLOOR_GROSS_PCT, peakProfitPct - pullbackThreshold);
                             if (profitPercentage <= trailingStopLevel) {
                                 isTrailingHit = true;
                             }
                         }
 
-                        const isTpHit = profitPercentage >= FIXED_TP_GROSS_PCT;
+                        const isTpHit = profitPercentage >= dynamicTpGrossPct;
                         const isStopLossHit = profitPercentage <= STOP_LOSS_FAST_CUT_PCT || btcRegime.regime === "CRASH_LIVE";
 
-                        console.log(`[Posizione] ${symbol} (€${(freeCoinAmount * currentPrice).toFixed(2)}) | PnL: ${profitPercentage.toFixed(2)}% | Picco: +${peakProfitPct.toFixed(2)}% | TP Lordo: +${FIXED_TP_GROSS_PCT}% | Aperta: ${minutesOpen.toFixed(0)}m (ILLIMITATA)`);
+                        console.log(`[Posizione] ${symbol} (€${(freeCoinAmount * currentPrice).toFixed(2)}) | ${assetState} | PnL: ${profitPercentage.toFixed(2)}% | Picco: +${peakProfitPct.toFixed(2)}% | TP Din: +${dynamicTpGrossPct.toFixed(2)}% | Aperta: ${minutesOpen.toFixed(0)}m (ILLIMITATA)`);
 
-                        if (isTpHit || isTrailingHit || isStopLossHit) {
-                            let reasonType = `TP LORDO (+${FIXED_TP_GROSS_PCT}%)`;
+                        if (isTpHit || shouldTakeUncertainProfit || isTrailingHit || isStopLossHit) {
+                            let reasonType = `TP DINAMICO ${assetState} (+${dynamicTpGrossPct.toFixed(2)}%)`;
                             if (btcRegime.regime === "CRASH_LIVE") reasonType = "CROLLO BTC";
                             else if (isStopLossHit) reasonType = `STOP LOSS / FAST CUT (${STOP_LOSS_FAST_CUT_PCT}%)`;
+                            else if (shouldTakeUncertainProfit) reasonType = `INCASSO ASSET INCERTO (${healthReason})`;
                             else if (isTrailingHit) reasonType = `TRAILING PROTETTIVO (picco +${peakProfitPct.toFixed(2)}%)`;
 
                             const sellBook = await evaluateOrderBookForExecution(symbol, 'sell');
@@ -764,7 +978,6 @@ async function runBotLoop() {
                     const nextWinnersSet = new Set();
                     const nextLosersSet = new Set();
 
-                    // 2A. Controllo diretto sui ticker /EUR attivi su Kraken
                     try {
                         const eurMarketSymbols = Object.keys(exchange.markets).filter(sym => {
                             if (!sym.endsWith('/EUR')) return false;
@@ -802,7 +1015,6 @@ async function runBotLoop() {
                         console.log(`[Movers Kraken] Errore lettura ticker 24h: ${krakenMoversErr.message}`);
                     }
 
-                    // 2B. Integrazione CoinMarketCap (se disponibile la chiave API)
                     if (CMC_API_KEY) {
                         try {
                             const cmcResponse = await axios.get('https://pro-api.coinmarketcap.com/v1/cryptocurrency/listings/latest', {
@@ -831,8 +1043,6 @@ async function runBotLoop() {
                         } catch (cmcErr) {
                             console.log(`[Movers CMC] Errore lettura CMC: ${cmcErr.message}`);
                         }
-                    } else {
-                        console.log(`[Movers CMC] CMC_API_KEY non impostata: uso controllo ticker 24h Kraken + watchlist.`);
                     }
 
                     let validatedWatchlist = [];
@@ -864,7 +1074,7 @@ async function runBotLoop() {
                     continue;
                 }
 
-                // 3. SCANNER SUPPORTI (5m, 15m, 30m) + EMA/RSI/BB + VINCENTI & PERDENTI
+                // 3. SCANNER SUPPORTI (5m, 15m, 30m) + EMA/RSI/BB + VOLUMI + VINCENTI & PERDENTI
                 for (const symbol of focusedHotPool) {
                     try {
                         if (!exchange.markets[symbol]) continue;
@@ -909,7 +1119,7 @@ async function runBotLoop() {
                             const refPrice = bookEval.bestBid > 0 ? bookEval.bestBid : currentPrice;
                             const amountToBuy = targetInvestmentSize / refPrice;
 
-                            console.log(`[Buy Tecnico] Tentativo limite €${targetInvestmentSize} su ${symbol} (Score ${setup.score.toFixed(1)}, TP +${FIXED_TP_GROSS_PCT}%) | ${setup.reason} | ${bookEval.reason}...`);
+                            console.log(`[Buy Tecnico] Tentativo limite €${targetInvestmentSize} su ${symbol} (Score ${setup.score.toFixed(1)}, TP Din +${STANDARD_TP_GROSS_PCT}%) | ${setup.reason} | ${bookEval.reason}...`);
 
                             try {
                                 const limitResult = await placeTimedLimitBuyOnBook(symbol, amountToBuy, bookEval);
@@ -929,7 +1139,7 @@ async function runBotLoop() {
                                 };
                                 lastBuyTimestamp = Date.now();
                                 console.log(`[BUY LIMIT OK] Acquistati ~€${(actualAmount * actualEntry).toFixed(2)} di ${symbol} @ €${actualEntry} | ${setup.reason}`);
-                                lastLog = `Acquistati ~€${(actualAmount * actualEntry).toFixed(2)} di ${symbol} (TP Lordo +${FIXED_TP_GROSS_PCT}%)`;
+                                lastLog = `Acquistati ~€${(actualAmount * actualEntry).toFixed(2)} di ${symbol}`;
                                 await new Promise(resolve => setTimeout(resolve, 5000));
                                 break;
                             } catch (orderErr) {
