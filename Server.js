@@ -15,7 +15,7 @@ const exchange = new ccxt.kraken({
 });
 
 let botRunning = true;
-let lastLog = "Bot Ordini Immediati avviato: Solo Watchlist, No BTC/ETH, Fibo + MA + Incrocio MA + Bollinger + SAR + RSI + Volumi (10€).";
+let lastLog = "Bot Ordini Immediati + Giro di Boa avviato: Solo Watchlist, No BTC/ETH, Fibo + MA + Incrocio MA + Bollinger + SAR + RSI + Volumi (10€).";
 let activeWatchlist = [];
 
 let activePositions = {};
@@ -37,17 +37,28 @@ const customWatchlistSymbols = [
     'UNI/EUR', 'ENA/EUR'
 ];
 
-// Parametri Operativi (apertura illimitata fino a TP, trailing o Stop Loss / Fast Cut)
+// Parametri Operativi (apertura illimitata fino a TP, giro di boa, trailing o Stop Loss / Fast Cut)
 const ORDER_SIZE_EUR = 10;
 const FIXED_TP_GROSS_PCT = 1.70;
-const TRAILING_ARM_GROSS_PCT = 1.15;
-const TRAILING_FLOOR_GROSS_PCT = 0.65;
-const TRAILING_PULLBACK_PCT = 0.35;
+
+// Trailing stop allineato agli ordini immediati (sopra commissioni A/R)
+const TRAILING_ARM_GROSS_PCT = 1.20;
+const TRAILING_FLOOR_GROSS_PCT = 0.90;
+const TRAILING_PULLBACK_PCT = 0.30;
+
+// Incasso anticipato quando un picco (sotto +1.70%) inizia a girare, ma è già in utile reale
+const EARLY_REVERSAL_MIN_GROSS_PCT = 1.00;
+const EARLY_REVERSAL_PEAK_MIN_PCT = 1.10;
+const EARLY_REVERSAL_PULLBACK_PCT = 0.25;
+
+// Stop loss / fast cut di invalidazione
 const STOP_LOSS_FAST_CUT_PCT = -1.35;
 
-// Order Book: controllo spread e profondità prima dell'ordine immediato
+// Order Book: controllo spread, profondità e muro in vendita (ask) vicino
 const MAX_ALLOWED_SPREAD_PCT = 0.50;
 const MIN_BOOK_DEPTH_EUR = 150;
+const ASK_WALL_MIN_EUR = 1200;
+const ASK_WALL_MAX_DIST_PCT = 0.95;
 
 // Filtro residui / briciole
 const MIN_TRACKED_POSITION_EUR = 1.50;
@@ -63,9 +74,9 @@ app.get('/', (req, res) => {
         <html>
             <head><title>Cryptobot39 - Watchlist Immediato</title></head>
             <body style="font-family: Arial; padding: 20px; background: #111; color: #fff;">
-                <h1>Cryptobot39 (Ordini Immediati - Solo Watchlist) - Stato: ${botRunning ? 'ATTIVO' : 'FERMO'}</h1>
+                <h1>Cryptobot39 (Ordini Immediati + Giro di Boa) - Stato: ${botRunning ? 'ATTIVO' : 'FERMO'}</h1>
                 <p><b>Ultima attività:</b> ${lastLog}</p>
-                <p><b>Esecuzione:</b> Immediata (Market) | <b>TP Lordo:</b> +${FIXED_TP_GROSS_PCT}% | <b>Stop/Fast Cut:</b> ${STOP_LOSS_FAST_CUT_PCT}% | <b>Tempo:</b> Illimitato</p>
+                <p><b>Esecuzione:</b> Immediata (Market) | <b>TP Lordo:</b> +${FIXED_TP_GROSS_PCT}% | <b>Giro di Boa >=:</b> +${EARLY_REVERSAL_MIN_GROSS_PCT}% | <b>Trailing Floor:</b> +${TRAILING_FLOOR_GROSS_PCT}% | <b>Stop:</b> ${STOP_LOSS_FAST_CUT_PCT}%</p>
                 <p><b>Posizioni Attive (>= €${MIN_TRACKED_POSITION_EUR}):</b> ${Object.keys(activePositions).length > 0 ? Object.keys(activePositions).join(', ') : 'Nessuna'}</p>
                 <p><b>Watchlist Attiva:</b> ${activeWatchlist.length > 0 ? activeWatchlist.join(', ') : 'Sincronizzazione in corso...'}</p>
             </body>
@@ -428,6 +439,66 @@ function evaluateAssetOpportunity(ohlcv5m, ohlcv15m, ohlcv30m) {
     };
 }
 
+// ================= RILEVAMENTO GIRO DI BOA DOPO UN PICCO =================
+
+function evaluatePeakReversalExit(ohlcv5m, currentPrice, profitPercentage, peakProfitPct, bookInfo) {
+    if (profitPercentage < EARLY_REVERSAL_MIN_GROSS_PCT || peakProfitPct < EARLY_REVERSAL_PEAK_MIN_PCT) {
+        return { shouldExit: false, reason: "" };
+    }
+
+    const pullbackFromPeak = peakProfitPct - profitPercentage;
+    if (pullbackFromPeak < EARLY_REVERSAL_PULLBACK_PCT) {
+        return { shouldExit: false, reason: "" };
+    }
+
+    let reversalSignals = 0;
+    const reasons = [`picco +${peakProfitPct.toFixed(2)}% -> calo ${pullbackFromPeak.toFixed(2)}%`];
+
+    if (ohlcv5m && ohlcv5m.length >= 6) {
+        const closes5m = ohlcv5m.map(c => c[4]);
+        const last5m = ohlcv5m[ohlcv5m.length - 1];
+        const prev5m = ohlcv5m[ohlcv5m.length - 2];
+
+        const lastRed = last5m[4] < last5m[1];
+        const prevRed = prev5m[4] < prev5m[1];
+        if (lastRed && prevRed) {
+            reversalSignals += 2;
+            reasons.push("2 candele rosse 5m");
+        } else if (lastRed && currentPrice < prev5m[4]) {
+            reversalSignals += 1;
+            reasons.push("candela rossa sotto min prec");
+        }
+
+        const ema9_5m = calculateEMA(closes5m, 9);
+        if (ema9_5m && currentPrice < ema9_5m) {
+            reversalSignals += 1;
+            reasons.push("sotto EMA9 5m");
+        }
+
+        const sar5m = calculateParabolicSAR(ohlcv5m, 0.02, 0.2);
+        if (sar5m && !sar5m.isLong) {
+            reversalSignals += 1.5;
+            reasons.push("SAR5m sopra il prezzo");
+        }
+
+        const rsi5m = calculateRSI(closes5m, 14);
+        if (rsi5m > 72) {
+            reversalSignals += 1;
+            reasons.push(`RSI5m ipercomprato ${rsi5m.toFixed(0)}`);
+        }
+    }
+
+    if (bookInfo && bookInfo.nearAskWall) {
+        reversalSignals += 1.5;
+        reasons.push(`muro ask €${bookInfo.nearAskWallEur.toFixed(0)} a +${bookInfo.nearAskWallDistPct.toFixed(2)}%`);
+    }
+
+    if (reversalSignals >= 2.0) {
+        return { shouldExit: true, reason: reasons.join(" + ") };
+    }
+    return { shouldExit: false, reason: "" };
+}
+
 // ================= ORDER BOOK =================
 
 async function evaluateOrderBookForExecution(symbol, side = 'buy') {
@@ -446,7 +517,8 @@ async function evaluateOrderBookForExecution(symbol, side = 'buy') {
             return { ok: false, reason: "Prezzi bid/ask non validi" };
         }
 
-        const spreadPct = ((bestAsk - bestBid) / ((bestBid + bestAsk) / 2)) * 100;
+        const midPrice = (bestBid + bestAsk) / 2;
+        const spreadPct = ((bestAsk - bestBid) / midPrice) * 100;
         if (spreadPct > MAX_ALLOWED_SPREAD_PCT) {
             return { ok: false, bestBid, bestAsk, spreadPct, reason: `Spread largo (${spreadPct.toFixed(2)}% > ${MAX_ALLOWED_SPREAD_PCT}%)` };
         }
@@ -463,7 +535,35 @@ async function evaluateOrderBookForExecution(symbol, side = 'buy') {
             return { ok: false, bestBid, bestAsk, spreadPct, depthEur, reason: `Profondità bassa (€${depthEur.toFixed(0)} < €${MIN_BOOK_DEPTH_EUR})` };
         }
 
-        return { ok: true, bestBid, bestAsk, spreadPct, depthEur, reason: `Book OK (spread ${spreadPct.toFixed(2)}%, prof €${depthEur.toFixed(0)})` };
+        let nearAskWall = false;
+        let nearAskWallEur = 0;
+        let nearAskWallDistPct = 999;
+
+        for (const lvl of asks.slice(0, 12)) {
+            const p = lvl[0];
+            const q = lvl[1];
+            if (typeof p === 'number' && typeof q === 'number' && p > bestAsk && q > 0) {
+                const distPct = ((p - bestAsk) / bestAsk) * 100;
+                const valEur = p * q;
+                if (distPct <= ASK_WALL_MAX_DIST_PCT && valEur >= ASK_WALL_MIN_EUR && valEur > nearAskWallEur) {
+                    nearAskWall = true;
+                    nearAskWallEur = valEur;
+                    nearAskWallDistPct = distPct;
+                }
+            }
+        }
+
+        return {
+            ok: true,
+            bestBid,
+            bestAsk,
+            spreadPct,
+            depthEur,
+            nearAskWall,
+            nearAskWallEur,
+            nearAskWallDistPct,
+            reason: `Book OK (spread ${spreadPct.toFixed(2)}%, prof €${depthEur.toFixed(0)})`
+        };
     } catch (e) {
         return { ok: false, reason: `Errore book: ${e.message}` };
     }
@@ -563,17 +663,31 @@ async function runBotLoop() {
                             }
                         }
 
+                        let ohlcv5mForExit = null;
+                        try {
+                            ohlcv5mForExit = await exchange.fetchOHLCV(symbol, '5m', undefined, 30);
+                        } catch (e) {}
+
+                        const sellBook = await evaluateOrderBookForExecution(symbol, 'sell');
+                        const reversalExit = evaluatePeakReversalExit(
+                            ohlcv5mForExit,
+                            currentPrice,
+                            profitPercentage,
+                            peakProfitPct,
+                            sellBook.ok ? sellBook : null
+                        );
+
                         const isTpHit = profitPercentage >= FIXED_TP_GROSS_PCT;
                         const isStopLossHit = profitPercentage <= STOP_LOSS_FAST_CUT_PCT;
 
                         console.log(`[Posizione] ${symbol} (€${(freeCoinAmount * currentPrice).toFixed(2)}) | PnL: ${profitPercentage.toFixed(2)}% | Picco: +${peakProfitPct.toFixed(2)}% | TP: +${FIXED_TP_GROSS_PCT}% | Aperta: ${minutesOpen.toFixed(0)}m`);
 
-                        if (isTpHit || isTrailingHit || isStopLossHit) {
+                        if (isTpHit || reversalExit.shouldExit || isTrailingHit || isStopLossHit) {
                             let reasonType = `TP LORDO (+${FIXED_TP_GROSS_PCT}%)`;
                             if (isStopLossHit) reasonType = `STOP LOSS / FAST CUT (${STOP_LOSS_FAST_CUT_PCT}%)`;
-                            else if (isTrailingHit) reasonType = `TRAILING PROTETTIVO (picco +${peakProfitPct.toFixed(2)}%)`;
+                            else if (reversalExit.shouldExit) reasonType = `GIRO DI BOA (${reversalExit.reason})`;
+                            else if (isTrailingHit) reasonType = `TRAILING PROTETTIVO (picco +${peakProfitPct.toFixed(2)}%, floor +${TRAILING_FLOOR_GROSS_PCT}%)`;
 
-                            const sellBook = await evaluateOrderBookForExecution(symbol, 'sell');
                             if (!sellBook.ok && !isStopLossHit) {
                                 console.log(`[BOOK VENDITA IN ATTESA] ${symbol}: ${sellBook.reason}. Rimando chiusura.`);
                                 continue;
@@ -688,7 +802,7 @@ async function runBotLoop() {
 }
 
 app.listen(PORT, () => {
-    console.log(`Server Watchlist Immediato in ascolto sulla porta ${PORT}`);
+    console.log(`Server Watchlist Immediato + Giro di Boa in ascolto sulla porta ${PORT}`);
     setTimeout(() => {
         runBotLoop();
     }, 3000);
